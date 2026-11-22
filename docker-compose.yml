@@ -1,0 +1,28 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: agentstack-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-agentstack}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-agentstack}
+      POSTGRES_DB: ${POSTGRES_DB:-agentstack}
+    ports:
+      - "${POSTGRES_PORT:-5439}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-agentstack} -d ${POSTGRES_DB:-agentstack}"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  temporal:
+    image: temporalio/temporal:latest
+    container_name: agentstack-temporal
+    command: ["server", "start-dev", "--ip", "0.0.0.0", "--ui-port", "8233"]
+    ports:
+      - "${TEMPORAL_PORT:-7233}:7233"
+      - "${TEMPORAL_UI_PORT:-8233}:8233"
+
+volumes:
+  postgres_data:
