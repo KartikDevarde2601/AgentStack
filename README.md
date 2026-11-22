@@ -40,7 +40,14 @@ A runnable full-stack deep research agent demo combining:
 
 ## Quick Start
 
-### 1. Start Postgres and Temporal
+### 1. Install workspace dependencies
+
+```bash
+pnpm install
+pnpm nx run backend:sync
+```
+
+### 2. Start Postgres and Temporal
 
 ```bash
 cp .env.example .env
@@ -50,39 +57,43 @@ docker compose up -d
 - Postgres listens on `localhost:5439` (avoids colliding with a local Postgres on `5432`).
 - Temporal gRPC listens on `localhost:7233` and the Temporal Web UI is at `http://localhost:8233`.
 
-### 2. Start the Temporal Worker
+### 3. Start the Temporal Worker
 
 ```bash
-cd backend
-uv sync
-uv run python -m app.temporal.worker
+pnpm dev:worker
 ```
 
-### 3. Start the FastAPI Backend
+### 4. Start the FastAPI Backend
 
 ```bash
-cd backend
-uv run uvicorn app.main:app --reload --port 8080
+pnpm dev:backend
 ```
 
 Set `OPENAI_API_KEY` in `.env` to run live OpenAI SDK calls. Leave it empty to run the deterministic demo researcher.
 
-### 4. Start the Vite React Frontend
+### 5. Start the Vite React Frontend
 
 ```bash
-cd frontend
-pnpm install
-pnpm dev
+pnpm dev:frontend
 ```
 
 Open `http://localhost:5175`.
 
-## Running Tests
+## Running Checks with Nx
 
 ```bash
-# Backend (Temporal time-skipping workflow tests + FastAPI/ChatKit tests)
-cd backend && uv run pytest -v
+# Run all tests (backend pytest + frontend Vitest)
+pnpm test
 
-# Frontend (TypeScript check, production build, and Vitest UI SDK sidebar tests)
-cd frontend && pnpm exec tsc --noEmit && pnpm run build && pnpm test --run
+# Run typechecking and production builds across all projects
+pnpm typecheck
+pnpm build
+
+# Target a single project
+pnpm nx test backend
+pnpm nx test frontend
+pnpm nx build frontend
+
+# Inspect the workspace project graph
+pnpm graph
 ```
