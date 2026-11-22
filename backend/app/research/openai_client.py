@@ -27,7 +27,6 @@ class OpenAIResearchClient:
 
         response = await self._client.chat.completions.create(
             model=self._model,
-            temperature=0.2,
             response_format={"type": "json_object"},
             messages=[
                 {
@@ -60,7 +59,6 @@ class OpenAIResearchClient:
 
         response = await self._client.chat.completions.create(
             model=self._model,
-            temperature=0.3,
             response_format={"type": "json_object"},
             messages=[
                 {
@@ -104,7 +102,6 @@ class OpenAIResearchClient:
         findings_payload = [finding.model_dump(mode="json") for finding in findings]
         response = await self._client.chat.completions.create(
             model=self._model,
-            temperature=0.3,
             messages=[
                 {
                     "role": "system",
