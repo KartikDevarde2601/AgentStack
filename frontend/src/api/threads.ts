@@ -1,7 +1,7 @@
 import type { HealthStatus, ThreadSummary } from '../types/threads';
 
 const rawApiBaseUrl =
-  import.meta.env.VITE_API_BASE_URL?.trim() || 'http://localhost:8000';
+  import.meta.env.VITE_API_BASE_URL?.trim() || 'http://localhost:8080';
 
 export const API_BASE_URL = rawApiBaseUrl.replace(/\/+$/, '');
 export const CHATKIT_API_URL = `${API_BASE_URL}/chatkit`;
@@ -44,7 +44,10 @@ async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export async function listThreads(): Promise<ThreadSummary[]> {
-  return requestJson<ThreadSummary[]>('/api/threads');
+  const data = await requestJson<{ threads: ThreadSummary[] } | ThreadSummary[]>(
+    '/api/threads',
+  );
+  return Array.isArray(data) ? data : data.threads;
 }
 
 export async function createThread(title?: string): Promise<ThreadSummary> {
@@ -61,5 +64,5 @@ export async function deleteThread(threadId: string): Promise<void> {
 }
 
 export async function getHealth(): Promise<HealthStatus> {
-  return requestJson<HealthStatus>('/api/health');
+  return requestJson<HealthStatus>('/health');
 }

@@ -13,7 +13,7 @@ A runnable full-stack deep research agent demo combining:
 
 ```text
 +-------------------------------------------------------------------+
-|  Vite + React 19 UI (http://localhost:5173)                       |
+|  Vite + React 19 UI (http://localhost:5175)                       |
 |  +---------------------------+  +-------------------------------+ |
 |  | Left: ThreadSidebar       |  | Right: ResearchChatPane       | |
 |  | @ui-sdk/react Listbox     |  | @openai/chatkit-react         | |
@@ -22,7 +22,7 @@ A runnable full-stack deep research agent demo combining:
 +---------------|---------------------------------|-----------------+
                 v                                 v
 +-------------------------------------------------------------------+
-|  FastAPI Backend (http://localhost:8000)                          |
+|  FastAPI Backend (http://localhost:8080)                          |
 |  - /api/threads, /api/threads/{id}/runs, /health                  |
 |  - /chatkit -> DeepResearchChatKitServer                          |
 +----------------------+--------------------------+-----------------+
@@ -62,7 +62,7 @@ uv run python -m app.temporal.worker
 
 ```bash
 cd backend
-uv run uvicorn app.main:app --reload --port 8000
+uv run uvicorn app.main:app --reload --port 8080
 ```
 
 Set `OPENAI_API_KEY` in `.env` to run live OpenAI SDK calls. Leave it empty to run the deterministic demo researcher.
@@ -75,7 +75,7 @@ pnpm install
 pnpm dev
 ```
 
-Open `http://localhost:5173`.
+Open `http://localhost:5175`.
 
 ## Running Tests
 

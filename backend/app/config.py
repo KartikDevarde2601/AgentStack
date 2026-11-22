@@ -19,9 +19,9 @@ class Settings(BaseSettings):
     temporal_task_queue: str = "deep-research-queue"
     openai_api_key: str = ""
     openai_model: str = "gpt-4.1-mini"
-    cors_origins: str = "http://localhost:5173,http://127.0.0.1:5173"
+    cors_origins: str = "http://localhost:5175,http://127.0.0.1:5175"
     api_host: str = "0.0.0.0"
-    api_port: int = 8000
+    api_port: int = 8080
 
     @property
     def cors_origin_list(self) -> list[str]:
