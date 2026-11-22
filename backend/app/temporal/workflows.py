@@ -7,7 +7,13 @@ from temporalio import workflow
 from temporalio.common import RetryPolicy
 
 with workflow.unsafe.imports_passed_through():
-    from app.domain import ResearchFinding, ResearchPhase, ResearchPlan, ResearchProgress
+    from app.domain import (
+        ApprovalDecision,
+        ResearchFinding,
+        ResearchPhase,
+        ResearchPlan,
+        ResearchProgress,
+    )
     from app.temporal.activities import GatherFindingInput, SynthesizeReportInput
 
 _ACTIVITY_RETRY = RetryPolicy(
@@ -25,13 +31,20 @@ class DeepResearchWorkflow:
             phase=ResearchPhase.QUEUED,
             message="Queued deep research workflow...",
         )
+        self._approval_decision: ApprovalDecision | None = None
 
     @workflow.query
     def get_progress(self) -> ResearchProgress:
         return self._progress
 
+    @workflow.signal
+    def submit_approval(self, decision: ApprovalDecision) -> None:
+        self._approval_decision = decision
+
     @workflow.run
-    async def run(self, query: str) -> ResearchProgress:
+    async def run(
+        self, query: str, require_approval: bool = False
+    ) -> ResearchProgress:
         workflow_id = workflow.info().workflow_id
         self._progress = ResearchProgress(
             workflow_id=workflow_id,
@@ -49,16 +62,57 @@ class DeepResearchWorkflow:
                 retry_policy=_ACTIVITY_RETRY,
             )
 
-            sub_questions = plan.sub_questions
+            sub_questions = list(plan.sub_questions)
+
+            if require_approval:
+                self._progress = ResearchProgress(
+                    workflow_id=workflow_id,
+                    query=query,
+                    phase=ResearchPhase.AWAITING_APPROVAL,
+                    message="Waiting for your approval on the research plan...",
+                    sub_questions=sub_questions,
+                    completed_sub_questions=0,
+                    total_sub_questions=len(sub_questions),
+                )
+                await workflow.wait_condition(
+                    lambda: self._approval_decision is not None
+                )
+                decision = self._approval_decision
+                assert decision is not None
+                if not decision.approved:
+                    reason = decision.reason or "Research plan cancelled by user."
+                    self._progress = self._progress.model_copy(
+                        update={
+                            "phase": ResearchPhase.COMPLETED,
+                            "message": "Research plan cancelled by user.",
+                            "approval_decision": decision,
+                            "report": (
+                                f"### Research Cancelled\n\n"
+                                f"Research for **{query}** was cancelled at the approval step.\n\n"
+                                f"_{reason}_"
+                            ),
+                        }
+                    )
+                    return self._progress
+
+                if decision.sub_questions:
+                    sub_questions = list(decision.sub_questions)
+                extra = decision.extra_focus.strip()
+                if extra and extra not in sub_questions:
+                    sub_questions.append(extra)
+                self._progress = self._progress.model_copy(
+                    update={"approval_decision": decision}
+                )
+
             total = len(sub_questions)
-            self._progress = ResearchProgress(
-                workflow_id=workflow_id,
-                query=query,
-                phase=ResearchPhase.RESEARCHING,
-                message=f"Researching {total} sub-questions in parallel (0/{total})...",
-                sub_questions=sub_questions,
-                completed_sub_questions=0,
-                total_sub_questions=total,
+            self._progress = self._progress.model_copy(
+                update={
+                    "phase": ResearchPhase.RESEARCHING,
+                    "message": f"Researching {total} sub-questions in parallel (0/{total})...",
+                    "sub_questions": sub_questions,
+                    "completed_sub_questions": 0,
+                    "total_sub_questions": total,
+                }
             )
 
             async def _investigate(sub_question: str) -> ResearchFinding:
@@ -86,6 +140,7 @@ class DeepResearchWorkflow:
                 update={
                     "phase": ResearchPhase.SYNTHESIZING,
                     "message": "Synthesizing findings into a structured report...",
+                    "findings": findings,
                 }
             )
 
@@ -101,6 +156,7 @@ class DeepResearchWorkflow:
                 update={
                     "phase": ResearchPhase.COMPLETED,
                     "message": "Deep research completed.",
+                    "findings": findings,
                     "report": report,
                 }
             )

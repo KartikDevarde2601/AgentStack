@@ -17,8 +17,8 @@ CREATE TABLE IF NOT EXISTS chatkit_items (
     payload JSONB NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS idx_chatkit_items_thread_order
-    ON chatkit_items (thread_id, created_at ASC, seq ASC);
+CREATE INDEX IF NOT EXISTS idx_chatkit_items_thread_seq
+    ON chatkit_items (thread_id, seq);
 
 CREATE TABLE IF NOT EXISTS chatkit_attachments (
     id TEXT PRIMARY KEY,

@@ -1,0 +1,42 @@
+{
+  "version": "1.0",
+  "name": "research_findings_explorer",
+  "template": "{% set title_icon = \"data:image/webp;base64,UklGRpwDAABXRUJQVlA4WAoAAAAQAAAANwAANwAAQUxQSIMCAAABkEXbtulIN07btm3btm3btm3btm3btmI7T7uq+r2XW/ns/okIBm4bKfIyHt8jyP+OkChToVKFsyaVo0mbv1Spgul18ZOm6dJrH01285c761qn/0tdbOTRVwaH3fj21IRyOmrJBzwIQhrCz0emIaU2GSETbIdqqugUPMMC3mf7F8+Yv+OBE+CuL/8FhD8cXzZt+srT3zjAPicJVf08YN1YJ83fa1GkqLTwBwCEznXMoiFxQZuz5xUG3AgaJex4XUspdx7FTgvC1z5JZC9oShDHNRTKubAlwol050MdIpxIARNOa+lsjqCH4K0SQSETzkSTJnPejJro6i54qxJVg4Mff7/f10AVP5soMuUEJ8ABrvFaemWd2BhBT8Fbqb0PT0e3HPMSge5xzDhNaVNEnuY3cDv331fxIe6lFGVR4hpjDbcXnUNnxlXxr7NUaLqd83y24pKXMdz0b+OsjmYKlckufz2RRgFfDXE3nY2RG21fYF/iOCmO4WVGUph+ysaImafyWJ7ZV6dQvaMs1sfnvaFRMeluAT6zD8D3JlFVmaSc8MrHeJ6cDuJHg0JmnIpagxCSoVrTKmkSL2bwtomBEsUyPo40JFwSfNPUELXv1yP7/errFC9ioraJqNMVq9u6Y6uaBVMQ0l3USJyrcotOnVpWz5uI5KOfcm7wgVeWAMMxPuPDNY3G8N5mNRZc/+EOcxzj/X1v1UQnNZYHAAgAAL+FZ794xCciPhOOxzkdhdzfAM5wY8u0IX2Hzjnwyg/wAhD+cnrZyF69hs7e99QJYL2CgrLjme3dCyUWn5AqXcNNBsC2t012yZWpUlUYd2pbfkIVdMoI51964ZLKkX63WhX5Bx4IAFZQOCDyAAAA0AYAnQEqOAA4AD5dJo1FI6IhGPuO2DgFxLIAaBjQG2A56TTAN4l/bkFQfwGirjoeoPbvDqatpa+cPd574s8AAP7/Ob1frQuP7unz//xYYR8mjCiP+I0FpWl1mNO2DJKPHf/0So4iv/V09wjAGY/8Hd/n4mJPvEF/ewsfknPIGZP3fhoUFupoaZi3/lm8wftno3Wr7cPOnDQo1bCnfvbZgAeDwlgd//qJZ422jpZdcb9zvf1INHsuadPxds3T7W3zie+1+OUxk7M0L7581pcO6lyHLoad+j/cw/TrS5j6UM14R7j/mV+CAX/+ODmil75QAAA=\" %}{\n  \"type\": \"ListView\",\n  \"status\": {\n    \"text\": {{ status_text | tojson }},\n    \"icon\": \"book-open\"\n  },\n  \"children\": [\n    {% for row in rows %}\n    {\n      \"type\": \"ListViewItem\",\n      \"gap\": 2,\n      \"align\": \"stretch\",\n      \"onClickAction\": {\n        \"type\": {{ toggle_action_type | tojson }},\n        \"streaming\": false,\n        \"payload\": {\n          \"workflow_id\": {{ workflow_id | tojson }},\n          \"expanded_indices\": {{ row.next_expanded | tojson }}\n        }\n      },\n      \"children\": [\n        {\n          \"type\": \"Col\",\n          \"gap\": 2,\n          \"flex\": 1,\n          \"padding\": 3,\n          \"radius\": \"xl\",\n          \"background\": {{ (\"#FFFFFF\" if row.is_open else \"#FAF9F5\") | tojson }},\n          \"border\": {% if row.is_open %}{\n            \"left\": { \"size\": 3, \"color\": \"#583AD8\" },\n            \"top\": { \"size\": 1, \"color\": \"#D7D2EE\" },\n            \"right\": { \"size\": 1, \"color\": \"#D7D2EE\" },\n            \"bottom\": { \"size\": 1, \"color\": \"#D7D2EE\" }\n          }{% else %}{\n            \"size\": 1,\n            \"color\": \"#E3E0D5\"\n          }{% endif %},\n          \"children\": [\n            {\n              \"type\": \"Row\",\n              \"justify\": \"between\",\n              \"align\": \"center\",\n              \"gap\": 2,\n              \"wrap\": \"wrap\",\n              \"children\": [\n                {\n                  \"type\": \"Row\",\n                  \"gap\": 2,\n                  \"align\": \"center\",\n                  \"flex\": 1,\n                  \"children\": [\n                    { \"type\": \"Image\", \"src\": {{ title_icon | tojson }}, \"alt\": \"\", \"width\": 24, \"height\": 24, \"fit\": \"contain\" },\n                    {\n                      \"type\": \"Text\",\n                      \"value\": {{ row.sub_question | tojson }},\n                      \"weight\": \"semibold\",\n                      \"size\": \"sm\",\n                      \"color\": \"#131420\"\n                    }\n                    {% if not row.is_open %},\n                    { \"type\": \"Icon\", \"name\": \"chevron-right\", \"size\": \"sm\", \"color\": \"#68697B\" }\n                    {% endif %}\n                  ]\n                },\n                {\n                  \"type\": \"Badge\",\n                  \"label\": {{ row.sources_badge | tojson }},\n                  \"color\": {{ row.badge_color | tojson }},\n                  \"variant\": \"soft\",\n                  \"size\": \"sm\",\n                  \"pill\": true\n                }\n              ]\n            },\n            {\n              \"type\": \"Text\",\n              \"value\": {{ row.summary | tojson }},\n              \"color\": \"#4B4C5E\",\n              \"size\": \"sm\",\n              \"maxLines\": {{ 10 if row.is_open else 2 }}\n            }\n            {% if row.is_open %}\n              {% if row.key_points %},\n              { \"type\": \"Divider\", \"color\": \"#E3E0D5\" },\n              {\n                \"type\": \"Col\",\n                \"gap\": 1,\n                \"padding\": { \"x\": 3, \"y\": 2 },\n                \"background\": \"#F4F3EC\",\n                \"radius\": \"xl\",\n                \"children\": [\n                  {\n                    \"type\": \"Caption\",\n                    \"value\": \"KEY TAKEAWAYS\",\n                    \"color\": \"#583AD8\",\n                    \"weight\": \"semibold\",\n                    \"size\": \"md\"\n                  },\n                  {% for point in row.key_points %}\n                  {\n                    \"type\": \"Row\",\n                    \"gap\": 2,\n                    \"align\": \"start\",\n                    \"children\": [\n                      { \"type\": \"Icon\", \"name\": \"dot\", \"size\": \"sm\", \"color\": \"#583AD8\" },\n                      { \"type\": \"Text\", \"value\": {{ point | tojson }}, \"size\": \"xs\", \"color\": \"#131420\" }\n                    ]\n                  }{% if not loop.last %},{% endif %}\n                  {% endfor %}\n                ]\n              }\n              {% endif %}\n              {% if row.sources_text %},\n              {\n                \"type\": \"Box\",\n                \"padding\": { \"x\": 2, \"y\": 1 },\n                \"background\": \"#E6FAF2\",\n                \"radius\": \"xl\",\n                \"children\": [\n                  {\n                    \"type\": \"Text\",\n                    \"value\": {{ row.sources_text | tojson }},\n                    \"color\": \"#131420\",\n                    \"size\": \"sm\"\n                  }\n                ]\n              }\n              {% endif %}\n            {% endif %}\n          ]\n        }\n      ]\n    }{% if not loop.last %},{% endif %}\n    {% endfor %}\n  ]\n}",
+  "jsonSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["workflow_id", "status_text", "toggle_action_type", "rows"],
+    "properties": {
+      "workflow_id": { "type": "string" },
+      "status_text": { "type": "string" },
+      "toggle_action_type": { "type": "string" },
+      "rows": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "required": [
+            "sub_question",
+            "summary",
+            "sources_badge",
+            "badge_color",
+            "is_open",
+            "next_expanded",
+            "key_points",
+            "sources_text"
+          ],
+          "properties": {
+            "sub_question": { "type": "string" },
+            "summary": { "type": "string" },
+            "sources_badge": { "type": "string" },
+            "badge_color": { "type": "string" },
+            "is_open": { "type": "boolean" },
+            "next_expanded": { "type": "array", "items": { "type": "integer" } },
+            "key_points": { "type": "array", "items": { "type": "string" } },
+            "sources_text": { "type": "string" }
+          }
+        }
+      }
+    }
+  }
+}

@@ -1,7 +1,11 @@
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { ChatKit, useChatKit } from '@openai/chatkit-react';
 import { Loader2 } from 'lucide-react';
 import { CHATKIT_API_URL, CHATKIT_DOMAIN_KEY } from '../api/threads';
+import { CHATKIT_FOODWORKS_THEME } from '../theme/foodworks';
+
+const RESUME_RESEARCH_ACTION_TYPE = 'research.resume';
+const FETCH_UPDATES_CACHE_TTL_MS = 5_500;
 
 export interface ResearchChatPaneProps {
   activeThreadId: string | null;
@@ -52,34 +56,27 @@ export function ResearchChatPane({
   onResponseStart,
   onResponseEnd,
 }: ResearchChatPaneProps) {
+  const [isReady, setIsReady] = useState(false);
+  const [loadedThreadId, setLoadedThreadId] = useState<string | null>(null);
+  const [isResponding, setIsResponding] = useState(false);
+
   const isReadyRef = useRef(false);
+  const isRespondingRef = useRef(false);
   const activeThreadIdRef = useRef<string | null>(activeThreadId);
   const syncedThreadIdRef = useRef<string | null>(activeThreadId);
   const lastRefreshNonceRef = useRef(refreshNonce);
+  const resumedThreadIdRef = useRef<string | null>(null);
+  const lastThreadLoadAtRef = useRef<number>(0);
 
   activeThreadIdRef.current = activeThreadId;
 
-  const { control, setThreadId, fetchUpdates } = useChatKit({
+  const { control, setThreadId, fetchUpdates, sendCustomAction } = useChatKit({
     api: {
       url: CHATKIT_API_URL,
       domainKey: CHATKIT_DOMAIN_KEY,
     },
     initialThread: activeThreadId,
-    theme: {
-      colorScheme: 'light',
-      radius: 'round',
-      density: 'normal',
-      color: {
-        grayscale: {
-          hue: 220,
-          tint: 2,
-        },
-        accent: {
-          primary: '#0f172a',
-          level: 2,
-        },
-      },
-    },
+    theme: CHATKIT_FOODWORKS_THEME,
     header: {
       enabled: true,
       title: {
@@ -101,23 +98,41 @@ export function ResearchChatPane({
     },
     onReady: () => {
       isReadyRef.current = true;
+      setIsReady(true);
       const desiredThreadId = activeThreadIdRef.current;
       if (syncedThreadIdRef.current !== desiredThreadId) {
         syncedThreadIdRef.current = desiredThreadId;
+        setLoadedThreadId(null);
         void setThreadId(desiredThreadId).catch(() => {});
       }
     },
     onThreadChange: ({ threadId }) => {
       syncedThreadIdRef.current = threadId;
+      if (threadId === null) {
+        setLoadedThreadId(null);
+      }
       onThreadChange(threadId);
     },
+    onThreadLoadStart: () => {
+      setLoadedThreadId(null);
+    },
+    onThreadLoadEnd: ({ threadId }) => {
+      lastThreadLoadAtRef.current = Date.now();
+      setLoadedThreadId(threadId);
+    },
     onResponseStart: () => {
+      isRespondingRef.current = true;
+      setIsResponding(true);
       onResponseStart?.();
     },
     onResponseEnd: () => {
+      isRespondingRef.current = false;
+      setIsResponding(false);
       onResponseEnd();
     },
     onError: ({ error }) => {
+      isRespondingRef.current = false;
+      setIsResponding(false);
       console.error('[ChatKit error]', error);
     },
   });
@@ -130,8 +145,48 @@ export function ResearchChatPane({
       return;
     }
     syncedThreadIdRef.current = activeThreadId;
+    setLoadedThreadId(null);
+    resumedThreadIdRef.current = null;
     void setThreadId(activeThreadId).catch(() => {});
   }, [activeThreadId, setThreadId]);
+
+  const normalizedPhase = (activeThreadPhase ?? '').toLowerCase();
+  const isActivePhase = ACTIVE_PHASES.has(normalizedPhase);
+
+  useEffect(() => {
+    if (!activeThreadId || !isActivePhase) {
+      resumedThreadIdRef.current = null;
+      return;
+    }
+    if (!isReady || loadedThreadId !== activeThreadId) {
+      return;
+    }
+    if (isResponding || isStreamingLocally) {
+      return;
+    }
+    if (resumedThreadIdRef.current === activeThreadId) {
+      return;
+    }
+
+    resumedThreadIdRef.current = activeThreadId;
+    void sendCustomAction({
+      type: RESUME_RESEARCH_ACTION_TYPE,
+      payload: { thread_id: activeThreadId },
+    }).catch((err) => {
+      console.warn('[ChatKit resume action failed]', err);
+      if (resumedThreadIdRef.current === activeThreadId) {
+        resumedThreadIdRef.current = null;
+      }
+    });
+  }, [
+    activeThreadId,
+    isActivePhase,
+    isReady,
+    loadedThreadId,
+    isResponding,
+    isStreamingLocally,
+    sendCustomAction,
+  ]);
 
   useEffect(() => {
     if (refreshNonce === lastRefreshNonceRef.current) {
@@ -142,19 +197,43 @@ export function ResearchChatPane({
     if (!isReadyRef.current || !currentId) {
       return;
     }
-    void fetchUpdates().catch(() => {
-      void setThreadId(currentId).catch(() => {});
-    });
+
+    const runRefresh = () => {
+      void fetchUpdates().catch(() => {
+        void setThreadId(currentId).catch(() => {});
+      });
+    };
+
+    runRefresh();
+
+    // Work around ChatKit's 5s threads.get_by_id promise cache (openai/chatkit-js#220)
+    // by scheduling one follow-up fetch if a background run completed shortly after load.
+    const elapsedSinceLoad = Date.now() - lastThreadLoadAtRef.current;
+    if (elapsedSinceLoad < FETCH_UPDATES_CACHE_TTL_MS) {
+      const delayMs = FETCH_UPDATES_CACHE_TTL_MS - elapsedSinceLoad;
+      const timerId = window.setTimeout(() => {
+        if (activeThreadIdRef.current === currentId && !isRespondingRef.current) {
+          runRefresh();
+        }
+      }, delayMs);
+      return () => {
+        window.clearTimeout(timerId);
+      };
+    }
   }, [refreshNonce, fetchUpdates, setThreadId]);
 
-  const normalizedPhase = (activeThreadPhase ?? '').toLowerCase();
   const showBackgroundBanner =
     Boolean(activeThreadId) &&
     !isStreamingLocally &&
-    ACTIVE_PHASES.has(normalizedPhase);
+    !isResponding &&
+    isActivePhase;
 
   return (
-    <main className="chat-pane" aria-label="Research conversation">
+    <main
+      className="chat-pane"
+      data-chat-state={activeThreadId ? 'active' : 'empty'}
+      aria-label="Research conversation"
+    >
       {showBackgroundBanner && (
         <div className="background-run-banner" role="status" aria-live="polite">
           <Loader2 size={14} className="spin" aria-hidden="true" />

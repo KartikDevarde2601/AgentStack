@@ -167,7 +167,7 @@ class PostgresChatKitStore(Store[RequestContext]):
             async with conn.cursor(row_factory=dict_row) as cur:
                 if after:
                     await cur.execute(
-                        "SELECT created_at, seq FROM chatkit_items WHERE thread_id = %s AND id = %s",
+                        "SELECT seq FROM chatkit_items WHERE thread_id = %s AND id = %s",
                         (thread_id, after),
                     )
                     cursor_row = await cur.fetchone()
@@ -176,13 +176,12 @@ class PostgresChatKitStore(Store[RequestContext]):
                             f"""
                             SELECT id, payload
                             FROM chatkit_items
-                            WHERE thread_id = %s AND (created_at, seq) {op} (%s, %s)
-                            ORDER BY created_at {direction}, seq {direction}
+                            WHERE thread_id = %s AND seq {op} %s
+                            ORDER BY seq {direction}
                             LIMIT %s
                             """,
                             (
                                 thread_id,
-                                cursor_row["created_at"],
                                 cursor_row["seq"],
                                 fetch_limit,
                             ),
@@ -193,7 +192,7 @@ class PostgresChatKitStore(Store[RequestContext]):
                             SELECT id, payload
                             FROM chatkit_items
                             WHERE thread_id = %s
-                            ORDER BY created_at {direction}, seq {direction}
+                            ORDER BY seq {direction}
                             LIMIT %s
                             """,
                             (thread_id, fetch_limit),
@@ -204,7 +203,7 @@ class PostgresChatKitStore(Store[RequestContext]):
                         SELECT id, payload
                         FROM chatkit_items
                         WHERE thread_id = %s
-                        ORDER BY created_at {direction}, seq {direction}
+                        ORDER BY seq {direction}
                         LIMIT %s
                         """,
                         (thread_id, fetch_limit),

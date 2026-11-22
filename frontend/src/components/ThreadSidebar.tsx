@@ -9,13 +9,10 @@ import {
 import { Button } from '@ui-sdk/react/button';
 import { Separator } from '@ui-sdk/react/separator';
 import {
-  Activity,
   Check,
-  Database,
   MessageSquare,
   Plus,
   RefreshCw,
-  Sparkles,
   Trash2,
 } from 'lucide-react';
 import type { HealthStatus, ThreadSummary } from '../types/threads';
@@ -101,9 +98,13 @@ export function ThreadSidebar({
     <aside className="sidebar" aria-label="Research threads">
       <div className="sidebar-header">
         <div className="brand-row">
-          <div className="brand-mark" aria-hidden="true">
-            <Sparkles size={16} />
-          </div>
+          <img
+            className="brand-mark"
+            src={`${import.meta.env.BASE_URL}brand/agentstack-mark.png`}
+            alt=""
+            width={34}
+            height={34}
+          />
           <div className="brand-copy">
             <h1 className="brand-title">AgentStack</h1>
             <p className="brand-subtitle">Deep Research Demo</p>
@@ -239,7 +240,7 @@ export function ThreadSidebar({
               health?.postgres ? 'health-pill--ok' : 'health-pill--warn'
             }`}
           >
-            <Database size={12} aria-hidden="true" />
+            <span className="health-pill-icon health-pill-icon--postgres" aria-hidden="true" />
             <span>Postgres</span>
           </span>
 
@@ -248,7 +249,7 @@ export function ThreadSidebar({
               health?.temporal ? 'health-pill--ok' : 'health-pill--warn'
             }`}
           >
-            <Activity size={12} aria-hidden="true" />
+            <span className="health-pill-icon health-pill-icon--temporal" aria-hidden="true" />
             <span>Temporal</span>
           </span>
 
@@ -259,7 +260,7 @@ export function ThreadSidebar({
                 : 'health-pill--demo'
             }`}
           >
-            <Sparkles size={12} aria-hidden="true" />
+            <span className="health-pill-icon health-pill-icon--mode" aria-hidden="true" />
             <span>{health ? health.openai_mode : 'offline'}</span>
           </span>
         </div>

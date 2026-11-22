@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import StrEnum
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -13,6 +14,7 @@ class RequestContext(BaseModel):
 class ResearchPhase(StrEnum):
     QUEUED = "queued"
     PLANNING = "planning"
+    AWAITING_APPROVAL = "awaiting_approval"
     RESEARCHING = "researching"
     SYNTHESIZING = "synthesizing"
     COMPLETED = "completed"
@@ -21,6 +23,14 @@ class ResearchPhase(StrEnum):
     @property
     def is_terminal(self) -> bool:
         return self in (ResearchPhase.COMPLETED, ResearchPhase.FAILED)
+
+
+class ApprovalDecision(BaseModel):
+    approved: bool
+    sub_questions: list[str] = Field(default_factory=list)
+    depth: Literal["concise", "standard", "deep"] = "standard"
+    extra_focus: str = ""
+    reason: str | None = None
 
 
 class ResearchPlan(BaseModel):
@@ -43,6 +53,8 @@ class ResearchProgress(BaseModel):
     sub_questions: list[str] = Field(default_factory=list)
     completed_sub_questions: int = 0
     total_sub_questions: int = 0
+    findings: list[ResearchFinding] = Field(default_factory=list)
+    approval_decision: ApprovalDecision | None = None
     report: str | None = None
     error: str | None = None
 
