@@ -3,7 +3,8 @@ export interface ThreadSummary {
   title: string | null;
   created_at: string;
   updated_at: string;
-  status: string;
+  status?: string | null;
+  item_count?: number;
   latest_phase: string | null;
 }
 

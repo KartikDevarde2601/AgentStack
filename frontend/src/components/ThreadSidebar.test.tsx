@@ -129,4 +129,37 @@ describe('ThreadSidebar', () => {
     expect(onDeleteThread).toHaveBeenCalledWith('thr_2');
     expect(onSelectThread).not.toHaveBeenCalled();
   });
+
+  it('renders threads cleanly when status is omitted by the backend payload', () => {
+    const threadsWithoutStatus: ThreadSummary[] = [
+      {
+        id: 'thr_3',
+        title: 'Backend summary without status field',
+        created_at: '2026-11-22T01:30:00Z',
+        updated_at: '2026-11-22T01:31:00Z',
+        item_count: 2,
+        latest_phase: 'completed',
+      },
+    ];
+
+    render(
+      <ThreadSidebar
+        threads={threadsWithoutStatus}
+        activeThreadId="thr_3"
+        health={SAMPLE_HEALTH}
+        isLoading={false}
+        isCreating={false}
+        error={null}
+        onSelectThread={vi.fn()}
+        onCreateThread={vi.fn()}
+        onDeleteThread={vi.fn()}
+        onRefresh={vi.fn()}
+      />,
+    );
+
+    expect(
+      screen.getByText('Backend summary without status field'),
+    ).toBeInTheDocument();
+    expect(screen.getByText('completed')).toBeInTheDocument();
+  });
 });

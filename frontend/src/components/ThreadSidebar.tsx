@@ -53,12 +53,17 @@ function formatRelativeTimestamp(iso: string): string {
   });
 }
 
-function getStatusVariant(status: string): 'active' | 'done' | 'error' | 'idle' {
-  const normalized = status.toLowerCase();
+function getStatusVariant(
+  status: string | null | undefined,
+): 'active' | 'done' | 'error' | 'idle' {
+  const normalized = (status ?? 'idle').toLowerCase();
   if (
+    normalized === 'queued' ||
+    normalized === 'planning' ||
     normalized === 'running' ||
     normalized === 'in_progress' ||
-    normalized === 'researching'
+    normalized === 'researching' ||
+    normalized === 'synthesizing'
   ) {
     return 'active';
   }
@@ -168,7 +173,8 @@ export function ThreadSidebar({
           >
             {threads.map((thread) => {
               const title = thread.title?.trim() || 'Untitled research';
-              const statusVariant = getStatusVariant(thread.status);
+              const phaseOrStatus = thread.latest_phase || thread.status || 'idle';
+              const statusVariant = getStatusVariant(phaseOrStatus);
               const relativeTime = formatRelativeTimestamp(
                 thread.updated_at || thread.created_at,
               );
@@ -194,7 +200,7 @@ export function ThreadSidebar({
                       <span
                         className={`status-badge status-badge--${statusVariant}`}
                       >
-                        {thread.latest_phase || thread.status}
+                        {phaseOrStatus}
                       </span>
                       {relativeTime && (
                         <span className="thread-item-time">{relativeTime}</span>
