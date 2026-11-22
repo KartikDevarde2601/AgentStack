@@ -6,4 +6,6 @@ __pycache__/
 node_modules/
 dist/
 .vite/
+.nx/cache
+.nx/workspace-data
 .DS_Store
