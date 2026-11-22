@@ -90,13 +90,22 @@ def create_app(
                 await pool.close()
 
     app = FastAPI(title="AgentStack Deep Research Backend", lifespan=lifespan)
+    allow_all_origins = "*" in cfg.cors_origin_list
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=cfg.cors_origin_list,
+        allow_origins=[] if allow_all_origins else cfg.cors_origin_list,
+        allow_origin_regex=".*" if allow_all_origins else None,
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+    @app.middleware("http")
+    async def allow_private_network_access(request: Request, call_next):
+        response = await call_next(request)
+        if request.headers.get("access-control-request-private-network") == "true":
+            response.headers["Access-Control-Allow-Private-Network"] = "true"
+        return response
 
     async def _ensure_temporal_runner(request: Request) -> None:
         if request.app.state.runner is not None:
