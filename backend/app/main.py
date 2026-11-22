@@ -98,14 +98,8 @@ def create_app(
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
+        allow_private_network=True,
     )
-
-    @app.middleware("http")
-    async def allow_private_network_access(request: Request, call_next):
-        response = await call_next(request)
-        if request.headers.get("access-control-request-private-network") == "true":
-            response.headers["Access-Control-Allow-Private-Network"] = "true"
-        return response
 
     async def _ensure_temporal_runner(request: Request) -> None:
         if request.app.state.runner is not None:
