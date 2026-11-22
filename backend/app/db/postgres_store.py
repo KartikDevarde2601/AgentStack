@@ -67,7 +67,8 @@ class PostgresChatKitStore(Store[RequestContext]):
         self, thread: ThreadMetadata, context: RequestContext
     ) -> None:
         now = datetime.now(UTC)
-        payload = thread.model_dump(mode="json")
+        metadata = ThreadMetadata.model_validate(thread.model_dump(exclude={"items"}))
+        payload = metadata.model_dump(mode="json")
         async with self._pool.connection() as conn:
             async with conn.cursor() as cur:
                 await cur.execute(
@@ -438,6 +439,21 @@ class PostgresChatKitStore(Store[RequestContext]):
                     ORDER BY created_at DESC
                     """,
                     (thread_id,),
+                )
+                rows = await cur.fetchall()
+        return [_row_to_run_record(row) for row in rows]
+
+    async def list_active_research_runs(self) -> list[ResearchRunRecord]:
+        async with self._pool.connection() as conn:
+            async with conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute(
+                    """
+                    SELECT *
+                    FROM research_runs
+                    WHERE phase NOT IN (%s, %s)
+                    ORDER BY created_at DESC
+                    """,
+                    (ResearchPhase.COMPLETED.value, ResearchPhase.FAILED.value),
                 )
                 rows = await cur.fetchall()
         return [_row_to_run_record(row) for row in rows]

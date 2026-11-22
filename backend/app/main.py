@@ -86,6 +86,7 @@ def create_app(
         try:
             yield
         finally:
+            await chatkit_server.close()
             if pool is not None:
                 await pool.close()
 
@@ -128,6 +129,8 @@ def create_app(
 
     @app.get("/api/threads")
     async def list_threads(request: Request) -> dict[str, Any]:
+        await _ensure_temporal_runner(request)
+        await request.app.state.chatkit_server.reconcile_active_runs()
         threads = await request.app.state.store.list_thread_summaries()
         return {"threads": [t.model_dump(mode="json") for t in threads]}
 

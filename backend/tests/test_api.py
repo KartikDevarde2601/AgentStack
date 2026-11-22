@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import uuid
 from datetime import UTC, datetime
@@ -43,7 +44,8 @@ class InMemoryChatKitStore(Store[RequestContext]):
     async def save_thread(
         self, thread: ThreadMetadata, context: RequestContext
     ) -> None:
-        self._threads[thread.id] = (thread.model_copy(deep=True), datetime.now(UTC))
+        metadata = ThreadMetadata.model_validate(thread.model_dump(exclude={"items"}))
+        self._threads[thread.id] = (metadata, datetime.now(UTC))
         self._items.setdefault(thread.id, [])
 
     async def load_threads(
@@ -215,6 +217,11 @@ class InMemoryChatKitStore(Store[RequestContext]):
         runs.sort(key=lambda r: r.created_at, reverse=True)
         return runs
 
+    async def list_active_research_runs(self) -> list[ResearchRunRecord]:
+        runs = [r for r in self._runs.values() if not r.phase.is_terminal]
+        runs.sort(key=lambda r: r.created_at, reverse=True)
+        return runs
+
 
 class FakeWorkflowHandle:
     def __init__(self, workflow_id: str, query: str) -> None:
@@ -264,8 +271,16 @@ class FakeWorkflowHandle:
 
 
 class FakeResearchRunner:
+    def __init__(self) -> None:
+        self.handles: dict[str, FakeWorkflowHandle] = {}
+
     async def start(self, workflow_id: str, query: str) -> FakeWorkflowHandle:
-        return FakeWorkflowHandle(workflow_id=workflow_id, query=query)
+        handle = FakeWorkflowHandle(workflow_id=workflow_id, query=query)
+        self.handles[workflow_id] = handle
+        return handle
+
+    def get_handle(self, workflow_id: str) -> FakeWorkflowHandle:
+        return self.handles[workflow_id]
 
 
 def _parse_sse_events(body: str) -> list[dict]:
@@ -374,3 +389,171 @@ async def test_health_threads_crud_and_chatkit_streaming() -> None:
 
             del_again = await client.delete(f"/api/threads/{created_id}")
             assert del_again.status_code == 404
+
+
+class GatedWorkflowHandle:
+    def __init__(self, workflow_id: str, query: str) -> None:
+        self.workflow_id = workflow_id
+        self.query = query
+        self.release_completion = asyncio.Event()
+        self.planning_observed = asyncio.Event()
+
+    async def get_progress(self) -> ResearchProgress:
+        if not self.release_completion.is_set():
+            self.planning_observed.set()
+            return ResearchProgress(
+                workflow_id=self.workflow_id,
+                query=self.query,
+                phase=ResearchPhase.PLANNING,
+                message="Planning research sub-questions...",
+            )
+        return ResearchProgress(
+            workflow_id=self.workflow_id,
+            query=self.query,
+            phase=ResearchPhase.COMPLETED,
+            message="Deep research completed.",
+            sub_questions=["Q1", "Q2"],
+            completed_sub_questions=2,
+            total_sub_questions=2,
+            report=f"# Deep Research Report: {self.query}\n\nCompleted in background.",
+        )
+
+
+class GatedResearchRunner:
+    def __init__(self) -> None:
+        self.handles: dict[str, GatedWorkflowHandle] = {}
+
+    async def start(self, workflow_id: str, query: str) -> GatedWorkflowHandle:
+        handle = GatedWorkflowHandle(workflow_id=workflow_id, query=query)
+        self.handles[workflow_id] = handle
+        return handle
+
+    def get_handle(self, workflow_id: str) -> GatedWorkflowHandle:
+        return self.handles[workflow_id]
+
+
+@pytest.mark.asyncio
+async def test_research_persists_report_when_client_disconnects_mid_stream() -> None:
+    store = InMemoryChatKitStore()
+    runner = GatedResearchRunner()
+    app = create_app(
+        settings=Settings(openai_api_key=""),
+        store=store,
+        runner=runner,
+        poll_interval_seconds=0.01,
+    )
+
+    async with app.router.lifespan_context(app):
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            chatkit_payload = {
+                "type": "threads.create",
+                "params": {
+                    "input": {
+                        "content": [
+                            {"type": "input_text", "text": "Durable workflow test"}
+                        ],
+                        "attachments": [],
+                        "inference_options": {},
+                    }
+                },
+            }
+
+            # Start streaming directly through ChatKitServer and close the SSE generator
+            # mid-stream (simulating closing the browser tab while research is still running).
+            created_thread_id: str | None = None
+            stream_result = await app.state.chatkit_server.process(
+                json.dumps(chatkit_payload).encode("utf-8"),
+                RequestContext(),
+            )
+            stream_iter = stream_result.json_events
+            try:
+                async for chunk in stream_iter:
+                    line = chunk.decode("utf-8").strip()
+                    if not line.startswith("data: "):
+                        continue
+                    event = json.loads(line[len("data: ") :])
+                    if event["type"] == "thread.created":
+                        created_thread_id = event["thread"]["id"]
+                    if event["type"] == "progress_update" and "Planning" in event["text"]:
+                        break
+            finally:
+                await stream_iter.aclose()
+
+            assert created_thread_id is not None
+            assert len(runner.handles) == 1
+            handle = next(iter(runner.handles.values()))
+
+            # Complete the Temporal workflow AFTER the browser tab closed.
+            handle.release_completion.set()
+            for _ in range(50):
+                runs = await store.list_research_runs(created_thread_id)
+                if runs and runs[0].phase == ResearchPhase.COMPLETED:
+                    break
+                await asyncio.sleep(0.02)
+
+            # Reopen browser tab: /api/threads and threads.get_by_id must return the completed report.
+            threads_res = await client.get("/api/threads")
+            assert threads_res.status_code == 200
+            thread_summary = next(
+                t for t in threads_res.json()["threads"] if t["id"] == created_thread_id
+            )
+            assert thread_summary["latest_phase"] == "completed"
+
+            reopen_res = await client.post(
+                "/chatkit",
+                json={
+                    "type": "threads.get_by_id",
+                    "params": {"thread_id": created_thread_id},
+                },
+            )
+            assert reopen_res.status_code == 200
+            items = reopen_res.json()["items"]["data"]
+            assistant_items = [i for i in items if i["type"] == "assistant_message"]
+            assert len(assistant_items) == 1
+            assert "Completed in background." in assistant_items[0]["content"][0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_reconcile_persists_completed_run_after_server_restart() -> None:
+    store = InMemoryChatKitStore()
+    runner = GatedResearchRunner()
+    app = create_app(
+        settings=Settings(openai_api_key=""),
+        store=store,
+        runner=runner,
+        poll_interval_seconds=0.01,
+    )
+
+    async with app.router.lifespan_context(app):
+        created = await store.create_thread(title="Orphaned run")
+        workflow_id = f"deep-research-{created.id}-reconcile"
+        handle = await runner.start(workflow_id=workflow_id, query="Orphaned query")
+        handle.release_completion.set()
+
+        # Simulate DB row left in 'researching' before a server restart.
+        await store.upsert_research_run(
+            thread_id=created.id,
+            workflow_id=workflow_id,
+            query="Orphaned query",
+            phase=ResearchPhase.RESEARCHING,
+            message="Researching sub-questions...",
+        )
+
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            reopen_res = await client.post(
+                "/chatkit",
+                json={
+                    "type": "threads.get_by_id",
+                    "params": {"thread_id": created.id},
+                },
+            )
+            assert reopen_res.status_code == 200
+            items = reopen_res.json()["items"]["data"]
+            assistant_items = [i for i in items if i["type"] == "assistant_message"]
+            assert len(assistant_items) == 1
+            assert "Completed in background." in assistant_items[0]["content"][0]["text"]
+
+            runs = await store.list_research_runs(created.id)
+            assert runs[0].phase == ResearchPhase.COMPLETED
