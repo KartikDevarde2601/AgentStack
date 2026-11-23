@@ -27,6 +27,7 @@ with workflow.unsafe.imports_passed_through():
         PlanResearchInput,
         PublishProgressInput,
         PublishTurnEndInput,
+        RecordFailedTurnsInput,
         SynthesizeReportInput,
     )
 
@@ -43,6 +44,7 @@ class AgentThreadInput(BaseModel):
     thread_id: str
     openai_conversation_id: str | None = None
     queued_messages: list[QueuedMessage] = Field(default_factory=list)
+    unrecorded_turns: list[tuple[str, str]] = Field(default_factory=list)
     require_approval: bool = True
     idle_timeout_seconds: int = DEFAULT_IDLE_TIMEOUT_SECONDS
     max_turns_before_continue: int = DEFAULT_MAX_TURNS_BEFORE_CONTINUE
@@ -74,6 +76,7 @@ class AgentThreadWorkflow:
         self._active_query: str = ""
         self._active_sub_questions: list[str] = []
         self._active_findings: list[ResearchFinding] = []
+        self._unrecorded_turns: list[tuple[str, str]] = []
 
     def _to_queued_message(self, msg: IncomingMessage) -> QueuedMessage:
         return QueuedMessage(
@@ -131,6 +134,7 @@ class AgentThreadWorkflow:
         self._thread_id = params.thread_id
         self._openai_conversation_id = params.openai_conversation_id
         self._queue.extend(params.queued_messages)
+        self._unrecorded_turns.extend(params.unrecorded_turns)
 
         while True:
             if not self._queue:
@@ -205,11 +209,29 @@ class AgentThreadWorkflow:
                         thread_id=self._thread_id,
                         openai_conversation_id=self._openai_conversation_id,
                         queued_messages=list(self._queue),
+                        unrecorded_turns=list(self._unrecorded_turns),
                         require_approval=params.require_approval,
                         idle_timeout_seconds=params.idle_timeout_seconds,
                         max_turns_before_continue=params.max_turns_before_continue,
                     )
                 )
+
+    async def _flush_unrecorded_turns(self, *, best_effort: bool = False) -> None:
+        if not self._unrecorded_turns or not self._openai_conversation_id:
+            return
+        retry_policy = (
+            RetryPolicy(maximum_attempts=1) if best_effort else _ACTIVITY_RETRY
+        )
+        await workflow.execute_activity(
+            "record_failed_turns_activity",
+            RecordFailedTurnsInput(
+                conversation_id=self._openai_conversation_id,
+                turns=list(self._unrecorded_turns),
+            ),
+            start_to_close_timeout=timedelta(seconds=30),
+            retry_policy=retry_policy,
+        )
+        self._unrecorded_turns.clear()
 
     async def _run_turn(
         self,
@@ -219,6 +241,7 @@ class AgentThreadWorkflow:
         require_approval: bool,
     ) -> None:
         query = msg.text
+        plan_succeeded = False
         try:
             if not msg.already_persisted:
                 await workflow.execute_activity(
@@ -248,6 +271,10 @@ class AgentThreadWorkflow:
                 retry_policy=_ACTIVITY_RETRY,
             )
 
+            # Flush any earlier failed turns that OpenAI's transactional
+            # responses.create rejected before appending to the Conversation.
+            await self._flush_unrecorded_turns()
+
             plan: ResearchPlan = await workflow.execute_activity(
                 "plan_research_activity",
                 PlanResearchInput(
@@ -258,12 +285,22 @@ class AgentThreadWorkflow:
                 start_to_close_timeout=timedelta(seconds=60),
                 retry_policy=_ACTIVITY_RETRY,
             )
+            plan_succeeded = True
+            query = plan.query or query
+            self._active_query = query
             sub_questions = list(plan.sub_questions)
             self._active_sub_questions = list(sub_questions)
             selected_depth = "standard"
 
             if require_approval:
                 approval_id = f"apr_{workflow.uuid4().hex[:12]}"
+                widget_id = f"wgt_approval_{turn_id}"
+                self._pending_approval = PendingApproval(
+                    turn_id=turn_id,
+                    approval_id=approval_id,
+                    sub_questions=sub_questions,
+                    widget_item_id=widget_id,
+                )
                 self._phase = ResearchPhase.AWAITING_APPROVAL
                 self._message = "Waiting for your approval on the research plan..."
 
@@ -282,7 +319,7 @@ class AgentThreadWorkflow:
                     retry_policy=_ACTIVITY_RETRY,
                 )
 
-                widget_id: str = await workflow.execute_activity(
+                await workflow.execute_activity(
                     "persist_approval_widget_activity",
                     PersistApprovalWidgetInput(
                         thread_id=self._thread_id,
@@ -293,12 +330,6 @@ class AgentThreadWorkflow:
                     result_type=str,
                     start_to_close_timeout=timedelta(seconds=30),
                     retry_policy=_ACTIVITY_RETRY,
-                )
-                self._pending_approval = PendingApproval(
-                    turn_id=turn_id,
-                    approval_id=approval_id,
-                    sub_questions=sub_questions,
-                    widget_item_id=widget_id,
                 )
 
                 await workflow.wait_condition(
@@ -503,6 +534,13 @@ class AgentThreadWorkflow:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            if not plan_succeeded:
+                self._unrecorded_turns.append((query, str(exc)))
+                try:
+                    await self._flush_unrecorded_turns(best_effort=True)
+                except Exception:
+                    # Keep in durable workflow state to flush on the next Turn.
+                    pass
             self._phase = ResearchPhase.FAILED
             self._message = f"Deep research failed: {exc}"
             await workflow.execute_activity(

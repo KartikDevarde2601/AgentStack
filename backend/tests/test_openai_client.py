@@ -18,7 +18,12 @@ async def test_openai_responses_json_object_requests_include_json_in_input() -> 
         captured.append(kwargs)
         if "sub-questions" in str(kwargs.get("input", "")):
             return SimpleNamespace(
-                output_text=json.dumps({"sub_questions": ["Q1", "Q2", "Q3"]})
+                output_text=json.dumps(
+                    {
+                        "topic": "Compare Postgres and SQLite",
+                        "sub_questions": ["Q1", "Q2", "Q3"],
+                    }
+                )
             )
         return SimpleNamespace(
             output_text=json.dumps(

@@ -244,6 +244,11 @@ class FakeLLM:
     async def create_conversation(self) -> str:
         return f"conv_{uuid.uuid4().hex[:8]}"
 
+    async def append_conversation_messages(
+        self, conversation_id: str, messages: list[dict[str, str]]
+    ) -> None:
+        return None
+
     async def close_dangling_tool_calls(
         self, conversation_id: str, call_ids: list[str]
     ) -> None:
@@ -299,6 +304,7 @@ def _worker_activities(activities: ThreadActivities) -> list:
     return [
         activities.ensure_openai_conversation_activity,
         activities.close_dangling_tool_calls_activity,
+        activities.record_failed_turns_activity,
         activities.persist_user_message_activity,
         activities.publish_progress_activity,
         activities.persist_approval_widget_activity,

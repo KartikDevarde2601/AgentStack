@@ -98,6 +98,11 @@ class FakeResearchLLMClient:
         self.created_conversations.append(conv_id)
         return conv_id
 
+    async def append_conversation_messages(
+        self, conversation_id: str, messages: list[dict[str, str]]
+    ) -> None:
+        return None
+
     async def close_dangling_tool_calls(
         self, conversation_id: str, call_ids: list[str]
     ) -> None:
@@ -153,6 +158,7 @@ def _all_activities(activities: ThreadActivities) -> list:
     return [
         activities.ensure_openai_conversation_activity,
         activities.close_dangling_tool_calls_activity,
+        activities.record_failed_turns_activity,
         activities.persist_user_message_activity,
         activities.publish_progress_activity,
         activities.persist_approval_widget_activity,
@@ -412,3 +418,114 @@ async def test_agent_thread_workflow_queue_cancel_and_idle_prune() -> None:
 
             # Idle-exit prunes ephemeral run_events for this thread (Q7).
             assert await bus.latest_seq(thread_id) == 0
+
+
+@pytest.mark.asyncio
+async def test_retry_after_failed_turn_preserves_original_topic_in_conversation() -> None:
+    """Regression test: OpenAI responses.create(conversation=...) is transactional,
+    so a failed Turn 1 never appends the user's prompt to the Conversation.
+    AgentThreadWorkflow must record/flush failed Turns so 'try again' resolves the original topic.
+    """
+
+    class TransactionalConversationLLM(FakeResearchLLMClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.conversation_history: dict[str, list[str]] = {}
+            self._remaining_plan_failures = 3  # exhausts maximum_attempts=3
+            self._remaining_flush_failures = 1  # fails best-effort flush during Turn 1 outage
+
+        async def create_conversation(self) -> str:
+            cid = await super().create_conversation()
+            self.conversation_history[cid] = []
+            return cid
+
+        async def append_conversation_messages(
+            self, conversation_id: str, messages: list[dict[str, str]]
+        ) -> None:
+            if self._remaining_flush_failures > 0:
+                self._remaining_flush_failures -= 1
+                raise RuntimeError("503 Service Unavailable")
+            for msg in messages:
+                self.conversation_history.setdefault(conversation_id, []).append(
+                    msg["content"]
+                )
+
+        async def generate_research_plan(
+            self, query: str, *, conversation_id: str | None = None
+        ) -> ResearchPlan:
+            if self._remaining_plan_failures > 0:
+                self._remaining_plan_failures -= 1
+                raise RuntimeError("400 Bad Request")
+
+            history = self.conversation_history.get(conversation_id or "", [])
+            combined = " ".join(history + [query]).lower()
+            if "temporal" not in combined:
+                return ResearchPlan(
+                    query=query,
+                    sub_questions=["What topic or question should the research address?"],
+                )
+            return ResearchPlan(
+                query="Temporal durable execution for deep research agents",
+                sub_questions=[
+                    "How does Temporal event sourcing recover agent state?",
+                    "How do Temporal signals enable HITL approval gates?",
+                ],
+            )
+
+    store = FakeThreadStore()
+    bus = InMemoryThreadEventBus()
+    llm = TransactionalConversationLLM()
+    activities = ThreadActivities(client=llm, store=store, event_bus=bus)
+
+    async with await WorkflowEnvironment.start_time_skipping(
+        data_converter=pydantic_data_converter
+    ) as env:
+        task_queue = f"test-retry-{uuid.uuid4().hex[:8]}"
+        orchestrator = TemporalThreadOrchestrator(
+            env.client, task_queue=task_queue, require_approval=True
+        )
+        async with Worker(
+            env.client,
+            task_queue=task_queue,
+            workflows=[AgentThreadWorkflow],
+            activities=_all_activities(activities),
+        ):
+            thread_id = f"thr_{uuid.uuid4().hex[:8]}"
+
+            # Turn 1 fails completely (including best-effort flush during outage).
+            await orchestrator.send_message(
+                thread_id,
+                IncomingMessage(
+                    message_id="msg_1",
+                    text="Explain how Temporal durable execution improves reliability for multi-step deep research agents.",
+                    already_persisted=True,
+                ),
+            )
+            for _ in range(250):
+                st = await orchestrator.get_state(thread_id)
+                if st.phase == ResearchPhase.IDLE and st.turns_since_continue == 1:
+                    break
+                await asyncio.sleep(0.02)
+            assert st.turns_since_continue == 1
+
+            # Turn 2 ("try again") flushes Turn 1 into the OpenAI Conversation first.
+            await orchestrator.send_message(
+                thread_id,
+                IncomingMessage(
+                    message_id="msg_2",
+                    text="try again",
+                    already_persisted=True,
+                ),
+            )
+            for _ in range(100):
+                st = await orchestrator.get_state(thread_id)
+                if st.phase == ResearchPhase.AWAITING_APPROVAL:
+                    break
+                await asyncio.sleep(0.02)
+
+            assert st.phase == ResearchPhase.AWAITING_APPROVAL
+            assert st.pending_approval is not None
+            assert any(
+                "temporal" in q.lower() for q in st.pending_approval.sub_questions
+            )
+

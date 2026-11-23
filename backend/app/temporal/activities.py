@@ -79,6 +79,11 @@ class CloseToolCallsInput(BaseModel):
     call_ids: list[str] = Field(default_factory=list)
 
 
+class RecordFailedTurnsInput(BaseModel):
+    conversation_id: str
+    turns: list[tuple[str, str]] = Field(default_factory=list)
+
+
 class PersistUserMessageInput(BaseModel):
     thread_id: str
     turn_id: str
@@ -187,6 +192,25 @@ class ThreadActivities:
     ) -> None:
         await self._client.close_dangling_tool_calls(
             params.conversation_id, params.call_ids
+        )
+
+    @activity.defn(name="record_failed_turns_activity")
+    async def record_failed_turns_activity(
+        self, params: RecordFailedTurnsInput
+    ) -> None:
+        messages: list[dict[str, str]] = []
+        for user_query, error_msg in params.turns:
+            messages.append({"role": "user", "content": user_query})
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": (
+                        f"Previous attempt to research this request failed ({error_msg})."
+                    ),
+                }
+            )
+        await self._client.append_conversation_messages(
+            params.conversation_id, messages
         )
 
     @activity.defn(name="persist_user_message_activity")

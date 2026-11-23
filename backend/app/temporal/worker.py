@@ -72,6 +72,7 @@ async def run_worker(settings: Settings | None = None) -> None:
             activities=[
                 activities.ensure_openai_conversation_activity,
                 activities.close_dangling_tool_calls_activity,
+                activities.record_failed_turns_activity,
                 activities.persist_user_message_activity,
                 activities.publish_progress_activity,
                 activities.persist_approval_widget_activity,

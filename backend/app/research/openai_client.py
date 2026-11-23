@@ -12,6 +12,10 @@ from app.domain import ResearchFinding, ResearchPlan
 class ResearchLLMClient(Protocol):
     async def create_conversation(self) -> str: ...
 
+    async def append_conversation_messages(
+        self, conversation_id: str, messages: list[dict[str, str]]
+    ) -> None: ...
+
     async def close_dangling_tool_calls(
         self, conversation_id: str, call_ids: list[str]
     ) -> None: ...
@@ -59,6 +63,27 @@ class OpenAIResearchClient:
         conversation = await self._client.conversations.create()
         return str(conversation.id)
 
+    async def append_conversation_messages(
+        self, conversation_id: str, messages: list[dict[str, str]]
+    ) -> None:
+        if not conversation_id or not messages:
+            return
+        items: list[dict[str, Any]] = [
+            {
+                "type": "message",
+                "role": msg["role"],
+                "content": msg["content"],
+            }
+            for msg in messages
+            if msg.get("content")
+        ]
+        if not items:
+            return
+        await self._client.conversations.items.create(
+            conversation_id=conversation_id,
+            items=items,  # type: ignore[arg-type]
+        )
+
     async def close_dangling_tool_calls(
         self, conversation_id: str, call_ids: list[str]
     ) -> None:
@@ -84,13 +109,16 @@ class OpenAIResearchClient:
         kwargs: dict[str, Any] = {
             "model": self._model,
             "instructions": (
-                "You are a senior research planner. Break the user's question into "
+                "You are a senior research planner. Use the full conversation history "
+                "to understand follow-ups, refinements, and retries (such as 'try again'). "
+                "Identify the concrete standalone research topic and break it into "
                 "3 distinct, focused sub-questions for parallel investigation. "
-                'Return strict JSON with shape: {"sub_questions": ["...", "...", "..."]}.'
+                'Return strict JSON with shape: {"topic": "...", "sub_questions": ["...", "...", "..."]}.'
             ),
             "input": (
-                f"Research query: {cleaned_query}\n\n"
-                'Return the 3 sub-questions as a JSON object: {"sub_questions": [...]}.'
+                f"User message: {cleaned_query}\n\n"
+                'Return the resolved research topic and 3 sub-questions as a JSON object: '
+                '{"topic": "...", "sub_questions": [...]}.'
             ),
             "text": {"format": {"type": "json_object"}},
         }
@@ -100,6 +128,7 @@ class OpenAIResearchClient:
         response = await self._client.responses.create(**kwargs)
         raw_content = (getattr(response, "output_text", None) or "{}").strip()
         parsed = json.loads(raw_content)
+        resolved_topic = str(parsed.get("topic") or "").strip() or cleaned_query
         sub_questions = [
             str(item).strip()
             for item in parsed.get("sub_questions", [])
@@ -107,7 +136,7 @@ class OpenAIResearchClient:
         ][:3]
         if not sub_questions:
             raise ValueError("OpenAI returned an empty research plan")
-        return ResearchPlan(query=cleaned_query, sub_questions=sub_questions)
+        return ResearchPlan(query=resolved_topic, sub_questions=sub_questions)
 
     async def investigate_sub_question(
         self,
