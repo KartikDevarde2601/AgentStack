@@ -88,7 +88,10 @@ class OpenAIResearchClient:
                 "3 distinct, focused sub-questions for parallel investigation. "
                 'Return strict JSON with shape: {"sub_questions": ["...", "...", "..."]}.'
             ),
-            "input": cleaned_query,
+            "input": (
+                f"Research query: {cleaned_query}\n\n"
+                'Return the 3 sub-questions as a JSON object: {"sub_questions": [...]}.'
+            ),
             "text": {"format": {"type": "json_object"}},
         }
         if conversation_id:
@@ -128,7 +131,12 @@ class OpenAIResearchClient:
                 'Return strict JSON with shape: {"summary": "...", '
                 '"key_points": ["...", "..."], "sources": ["..."]}.'
             ),
-            input=f"Main query: {query}\nSub-question: {sub_question}",
+            input=(
+                f"Main query: {query}\n"
+                f"Sub-question: {sub_question}\n\n"
+                'Return your finding as a JSON object: {"summary": "...", '
+                '"key_points": [...], "sources": [...]}.'
+            ),
             text={"format": {"type": "json_object"}},
         )
         raw_content = (getattr(response, "output_text", None) or "{}").strip()
