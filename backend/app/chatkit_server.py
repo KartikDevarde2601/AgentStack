@@ -11,6 +11,8 @@ from chatkit.store import Store
 from chatkit.types import (
     Action,
     AssistantMessageContent,
+    AssistantMessageContentPartAdded,
+    AssistantMessageContentPartDone,
     AssistantMessageContentPartTextDelta,
     AssistantMessageItem,
     ProgressUpdateEvent,
@@ -324,6 +326,7 @@ class DeepResearchChatKitServer(ChatKitServer[RequestContext]):
         active_turn_id: str | None = None,
     ) -> AsyncIterator[ThreadStreamEvent]:
         highest_attempt_by_activity: dict[str, int] = {}
+        open_content_part_items: set[str] = set()
 
         async for ev in self._event_bus.subscribe(thread_id, after_seq=after_seq):
             if active_turn_id is not None and ev.turn_id != active_turn_id:
@@ -348,11 +351,26 @@ class DeepResearchChatKitServer(ChatKitServer[RequestContext]):
                 )
             elif ev.kind == ThreadEventKind.ITEM_ADDED:
                 item = _THREAD_ITEM_ADAPTER.validate_python(ev.payload["item"])
+                is_streaming_assistant = isinstance(item, AssistantMessageItem) and (
+                    not item.content
+                    or (len(item.content) == 1 and not item.content[0].text)
+                )
+                if is_streaming_assistant:
+                    item = item.model_copy(update={"content": []})
                 if is_retry:
                     # Reset previously streamed partial text before retry deltas arrive.
                     yield ThreadItemReplacedEvent(item=item)
                 else:
                     yield ThreadItemAddedEvent(item=item)
+                if is_streaming_assistant:
+                    open_content_part_items.add(item.id)
+                    yield ThreadItemUpdatedEvent(
+                        item_id=item.id,
+                        update=AssistantMessageContentPartAdded(
+                            content_index=0,
+                            content=AssistantMessageContent(text=""),
+                        ),
+                    )
             elif ev.kind == ThreadEventKind.TEXT_DELTA:
                 yield ThreadItemUpdatedEvent(
                     item_id=str(ev.payload["item_id"]),
@@ -363,6 +381,19 @@ class DeepResearchChatKitServer(ChatKitServer[RequestContext]):
                 )
             elif ev.kind == ThreadEventKind.ITEM_DONE:
                 item = _THREAD_ITEM_ADAPTER.validate_python(ev.payload["item"])
+                if (
+                    isinstance(item, AssistantMessageItem)
+                    and item.id in open_content_part_items
+                ):
+                    open_content_part_items.discard(item.id)
+                    if item.content:
+                        yield ThreadItemUpdatedEvent(
+                            item_id=item.id,
+                            update=AssistantMessageContentPartDone(
+                                content_index=0,
+                                content=item.content[0],
+                            ),
+                        )
                 yield ThreadItemDoneEvent(item=item)
             elif ev.kind == ThreadEventKind.ITEM_REPLACED:
                 item = _THREAD_ITEM_ADAPTER.validate_python(ev.payload["item"])

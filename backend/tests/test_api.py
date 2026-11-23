@@ -521,3 +521,88 @@ async def test_health_threads_crud_approval_and_streaming() -> None:
                         },
                     )
                     assert reject_res.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_streaming_report_opens_and_closes_chatkit_content_part() -> None:
+    """Regression test: ChatKit's streaming renderer restarts fade-in animations
+    across earlier blocks if thread.item.added pre-populates content instead of
+    emitting content=[] followed by assistant_message.content_part.added/done.
+    """
+    store = InMemoryChatKitStore()
+    bus = InMemoryThreadEventBus()
+    llm = FakeLLM()
+    activities = ThreadActivities(client=llm, store=store, event_bus=bus)
+
+    async with await WorkflowEnvironment.start_time_skipping(
+        data_converter=pydantic_data_converter
+    ) as env:
+        task_queue = f"test-stream-proto-{uuid.uuid4().hex[:8]}"
+        orchestrator = TemporalThreadOrchestrator(
+            env.client, task_queue=task_queue, require_approval=False
+        )
+        app = create_app(
+            settings=Settings(openai_api_key="sk-test"),
+            store=store,
+            orchestrator=orchestrator,
+            event_bus=bus,
+        )
+
+        async with Worker(
+            env.client,
+            task_queue=task_queue,
+            workflows=[AgentThreadWorkflow],
+            activities=_worker_activities(activities),
+        ):
+            async with app.router.lifespan_context(app):
+                transport = httpx.ASGITransport(app=app)
+                async with httpx.AsyncClient(
+                    transport=transport, base_url="http://test"
+                ) as client:
+                    res = await client.post(
+                        "/chatkit",
+                        json={
+                            "type": "threads.create",
+                            "params": {
+                                "input": {
+                                    "content": [
+                                        {
+                                            "type": "input_text",
+                                            "text": "Compare Temporal and Celery",
+                                        }
+                                    ],
+                                    "attachments": [],
+                                    "inference_options": {},
+                                }
+                            },
+                        },
+                    )
+                    assert res.status_code == 200
+                    events = _parse_sse_events(res.text)
+
+    added_idx, added_ev = next(
+        (i, e)
+        for i, e in enumerate(events)
+        if e["type"] == "thread.item.added"
+        and e["item"]["type"] == "assistant_message"
+    )
+    assistant_id = added_ev["item"]["id"]
+    assert added_ev["item"]["content"] == []
+
+    msg_updates = [
+        (i, e["update"]["type"])
+        for i, e in enumerate(events)
+        if e["type"] == "thread.item.updated" and e["item_id"] == assistant_id
+    ]
+    assert msg_updates, "expected streaming updates for assistant message"
+    assert msg_updates[0][1] == "assistant_message.content_part.added"
+    assert msg_updates[0][0] > added_idx
+    assert any(kind == "assistant_message.content_part.text_delta" for _, kind in msg_updates)
+    assert msg_updates[-1][1] == "assistant_message.content_part.done"
+
+    done_idx = next(
+        i
+        for i, e in enumerate(events)
+        if e["type"] == "thread.item.done" and e["item"]["id"] == assistant_id
+    )
+    assert msg_updates[-1][0] < done_idx
