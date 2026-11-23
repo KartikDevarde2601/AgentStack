@@ -1,4 +1,4 @@
-import { act, render, screen } from '@testing-library/react';
+import { act, render } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { ResearchChatPane } from './ResearchChatPane';
 
@@ -36,9 +36,10 @@ vi.mock('@openai/chatkit-react', () => ({
 describe('ResearchChatPane', () => {
   beforeEach(() => {
     latestOptions = {};
-    setThreadIdMock.mockClear();
-    fetchUpdatesMock.mockClear();
-    sendCustomActionMock.mockClear();
+    vi.restoreAllMocks();
+    setThreadIdMock.mockReset().mockResolvedValue(undefined);
+    fetchUpdatesMock.mockReset().mockResolvedValue(undefined);
+    sendCustomActionMock.mockReset().mockResolvedValue(undefined);
   });
 
   it('calls sendCustomAction(research.resume) only after onReady and onThreadLoadEnd for an active thread', () => {
@@ -105,29 +106,6 @@ describe('ResearchChatPane', () => {
       latestOptions.onThreadLoadEnd?.({ threadId: 'thr_done' });
     });
     expect(sendCustomActionMock).not.toHaveBeenCalled();
-  });
-
-  it('hides the fallback banner once the resumed native stream fires onResponseStart', () => {
-    render(
-      <ResearchChatPane
-        activeThreadId="thr_active"
-        activeThreadPhase="synthesizing"
-        isStreamingLocally={false}
-        onThreadChange={vi.fn()}
-        onResponseStart={vi.fn()}
-        onResponseEnd={vi.fn()}
-      />,
-    );
-
-    expect(screen.getByRole('status')).toBeInTheDocument();
-
-    act(() => {
-      latestOptions.onReady?.();
-      latestOptions.onThreadLoadEnd?.({ threadId: 'thr_active' });
-      latestOptions.onResponseStart?.();
-    });
-
-    expect(screen.queryByRole('status')).not.toBeInTheDocument();
   });
 
   it('re-attaches via sendCustomAction when switching away and back to an active thread', () => {

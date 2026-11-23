@@ -12,14 +12,12 @@ from fastapi.responses import StreamingResponse
 from psycopg_pool import AsyncConnectionPool
 from pydantic import BaseModel
 
-from app.chatkit_server import (
-    DeepResearchChatKitServer,
-    ResearchWorkflowRunner,
-    TemporalResearchRunner,
-)
+from app.chatkit_server import DeepResearchChatKitServer
 from app.config import Settings, get_settings
 from app.db.postgres_store import PostgresChatKitStore
 from app.domain import RequestContext
+from app.events import InMemoryThreadEventBus, PostgresThreadEventBus, ThreadEventBus
+from app.temporal.orchestrator import TemporalThreadOrchestrator, ThreadOrchestrator
 from app.temporal.worker import connect_temporal_client
 
 logger = logging.getLogger(__name__)
@@ -32,8 +30,8 @@ class CreateThreadRequest(BaseModel):
 def create_app(
     settings: Settings | None = None,
     store: Any = None,
-    runner: ResearchWorkflowRunner | None = None,
-    poll_interval_seconds: float = 0.25,
+    orchestrator: ThreadOrchestrator | None = None,
+    event_bus: ThreadEventBus | None = None,
 ) -> FastAPI:
     cfg = settings or get_settings()
 
@@ -41,7 +39,8 @@ def create_app(
     async def lifespan(app: FastAPI):
         pool: AsyncConnectionPool[Any] | None = None
         active_store = store
-        active_runner = runner
+        active_orchestrator = orchestrator
+        active_event_bus = event_bus
         temporal_client = None
 
         if active_store is None:
@@ -59,10 +58,18 @@ def create_app(
             except Exception as exc:
                 logger.warning("Postgres initialization failed at startup: %s", exc)
 
-        if active_runner is None:
+        if active_event_bus is None:
+            if pool is not None:
+                active_event_bus = PostgresThreadEventBus(
+                    pool=pool, dsn=cfg.database_url
+                )
+            else:
+                active_event_bus = InMemoryThreadEventBus()
+
+        if active_orchestrator is None:
             try:
                 temporal_client = await connect_temporal_client(cfg)
-                active_runner = TemporalResearchRunner(
+                active_orchestrator = TemporalThreadOrchestrator(
                     client=temporal_client,
                     task_queue=cfg.temporal_task_queue,
                 )
@@ -71,16 +78,16 @@ def create_app(
 
         chatkit_server = DeepResearchChatKitServer(
             store=active_store,
-            runner=active_runner,
-            run_store=active_store,
-            poll_interval_seconds=poll_interval_seconds,
+            orchestrator=active_orchestrator,
+            event_bus=active_event_bus,
         )
 
         app.state.settings = cfg
         app.state.pool = pool
         app.state.store = active_store
+        app.state.event_bus = active_event_bus
         app.state.temporal_client = temporal_client
-        app.state.runner = active_runner
+        app.state.orchestrator = active_orchestrator
         app.state.chatkit_server = chatkit_server
 
         try:
@@ -102,24 +109,26 @@ def create_app(
         allow_private_network=True,
     )
 
-    async def _ensure_temporal_runner(request: Request) -> None:
-        if request.app.state.runner is not None:
-            return
+    async def _ensure_orchestrator(request: Request) -> ThreadOrchestrator | None:
+        if request.app.state.orchestrator is not None:
+            return request.app.state.orchestrator
         try:
             client = await connect_temporal_client(request.app.state.settings)
-            temporal_runner = TemporalResearchRunner(
+            orch = TemporalThreadOrchestrator(
                 client=client,
                 task_queue=request.app.state.settings.temporal_task_queue,
             )
             request.app.state.temporal_client = client
-            request.app.state.runner = temporal_runner
-            request.app.state.chatkit_server.set_runner(temporal_runner)
+            request.app.state.orchestrator = orch
+            request.app.state.chatkit_server.set_orchestrator(orch)
+            return orch
         except Exception as exc:
             logger.warning("Lazy Temporal reconnect failed: %s", exc)
+            return None
 
     @app.post("/chatkit")
     async def chatkit_endpoint(request: Request) -> Response:
-        await _ensure_temporal_runner(request)
+        await _ensure_orchestrator(request)
         payload = await request.body()
         context = RequestContext()
         result = await request.app.state.chatkit_server.process(payload, context)
@@ -129,8 +138,6 @@ def create_app(
 
     @app.get("/api/threads")
     async def list_threads(request: Request) -> dict[str, Any]:
-        await _ensure_temporal_runner(request)
-        await request.app.state.chatkit_server.reconcile_active_runs()
         threads = await request.app.state.store.list_thread_summaries()
         return {"threads": [t.model_dump(mode="json") for t in threads]}
 
@@ -159,13 +166,23 @@ def create_app(
         runs = await request.app.state.store.list_research_runs(thread_id)
         return {"runs": [r.model_dump(mode="json") for r in runs]}
 
+    @app.get("/api/threads/{thread_id}/state")
+    async def get_thread_state(thread_id: str, request: Request) -> dict[str, Any]:
+        orch = await _ensure_orchestrator(request)
+        if orch is None:
+            raise HTTPException(
+                status_code=503, detail="Temporal orchestrator unavailable"
+            )
+        state = await orch.get_state(thread_id)
+        return state.model_dump(mode="json")
+
     @app.get("/health")
     async def health(request: Request) -> dict[str, Any]:
         postgres_ok = await request.app.state.store.ping()
-        temporal_ok = request.app.state.runner is not None
+        temporal_ok = request.app.state.orchestrator is not None
         if not temporal_ok:
-            await _ensure_temporal_runner(request)
-            temporal_ok = request.app.state.runner is not None
+            await _ensure_orchestrator(request)
+            temporal_ok = request.app.state.orchestrator is not None
         return {
             "status": "ok",
             "postgres": postgres_ok,

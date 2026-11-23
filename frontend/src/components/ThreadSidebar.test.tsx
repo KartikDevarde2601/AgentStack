@@ -27,7 +27,7 @@ const SAMPLE_HEALTH: HealthStatus = {
   status: 'ok',
   postgres: true,
   temporal: true,
-  openai_mode: 'demo',
+  openai_mode: 'live',
 };
 
 describe('ThreadSidebar', () => {
@@ -62,7 +62,7 @@ describe('ThreadSidebar', () => {
 
     expect(screen.getByText('Postgres')).toBeInTheDocument();
     expect(screen.getByText('Temporal')).toBeInTheDocument();
-    expect(screen.getByText('demo')).toBeInTheDocument();
+    expect(screen.getByText('live')).toBeInTheDocument();
   });
 
   it('selects a thread on click and via keyboard navigation through @ui-sdk Listbox', async () => {

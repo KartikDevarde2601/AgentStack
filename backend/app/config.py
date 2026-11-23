@@ -28,8 +28,17 @@ class Settings(BaseSettings):
         return [origin.strip() for origin in self.cors_origins.split(",") if origin.strip()]
 
     @property
-    def openai_mode(self) -> Literal["live", "demo"]:
-        return "live" if self.openai_api_key.strip() else "demo"
+    def openai_mode(self) -> Literal["live", "unconfigured"]:
+        return "live" if self.openai_api_key.strip() else "unconfigured"
+
+    def require_openai_api_key(self) -> str:
+        key = self.openai_api_key.strip()
+        if not key:
+            raise RuntimeError(
+                "OPENAI_API_KEY is required to run AgentStack. "
+                "Set OPENAI_API_KEY in your environment or .env file."
+            )
+        return key
 
 
 @lru_cache

@@ -1,6 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
 import { ChatKit, useChatKit } from '@openai/chatkit-react';
-import { Loader2 } from 'lucide-react';
 import { CHATKIT_API_URL, CHATKIT_DOMAIN_KEY } from '../api/threads';
 import { CHATKIT_FOODWORKS_THEME } from '../theme/foodworks';
 
@@ -206,8 +205,6 @@ export function ResearchChatPane({
 
     runRefresh();
 
-    // Work around ChatKit's 5s threads.get_by_id promise cache (openai/chatkit-js#220)
-    // by scheduling one follow-up fetch if a background run completed shortly after load.
     const elapsedSinceLoad = Date.now() - lastThreadLoadAtRef.current;
     if (elapsedSinceLoad < FETCH_UPDATES_CACHE_TTL_MS) {
       const delayMs = FETCH_UPDATES_CACHE_TTL_MS - elapsedSinceLoad;
@@ -222,27 +219,12 @@ export function ResearchChatPane({
     }
   }, [refreshNonce, fetchUpdates, setThreadId]);
 
-  const showBackgroundBanner =
-    Boolean(activeThreadId) &&
-    !isStreamingLocally &&
-    !isResponding &&
-    isActivePhase;
-
   return (
     <main
       className="chat-pane"
       data-chat-state={activeThreadId ? 'active' : 'empty'}
       aria-label="Research conversation"
     >
-      {showBackgroundBanner && (
-        <div className="background-run-banner" role="status" aria-live="polite">
-          <Loader2 size={14} className="spin" aria-hidden="true" />
-          <span>
-            Research is running in the background ({normalizedPhase})… Results
-            will appear automatically when ready.
-          </span>
-        </div>
-      )}
       <ChatKit control={control} className="chatkit-surface" />
     </main>
   );

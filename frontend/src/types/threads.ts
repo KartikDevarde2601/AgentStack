@@ -12,5 +12,5 @@ export interface HealthStatus {
   status: string;
   postgres: boolean;
   temporal: boolean;
-  openai_mode: 'live' | 'demo';
+  openai_mode: 'live' | 'unconfigured';
 }
