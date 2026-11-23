@@ -9,8 +9,17 @@ A persistent research conversation with a user, containing an ordered timeline o
 _Avoid_: Session, chat, room
 
 **Turn**:
-A single user request and the agent's complete response cycle, including any planning, approval, parallel investigation, and synthesis.
+A single user request and the agent's complete response cycle. A Turn can produce a Direct Answer, a Clarification, or Deep Research.
 _Avoid_: Run, execution, request
+
+**Direct Answer**:
+A conversational reply based on the request, the Thread, or general knowledge.
+
+**Clarification**:
+A focused question about the topic or whether the user wants a Direct Answer or Deep Research.
+
+**Deep Research**:
+A multi-part investigation that starts with a Research Plan and produces findings and a report.
 
 **Research Plan**:
 The proposed set of sub-questions and depth settings produced for a Turn before parallel investigation begins.

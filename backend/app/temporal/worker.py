@@ -76,6 +76,7 @@ async def run_worker(settings: Settings | None = None) -> None:
                 activities.publish_progress_activity,
                 activities.persist_approval_widget_activity,
                 activities.plan_research_activity,
+                activities.resolve_turn_activity,
                 activities.investigate_sub_question_activity,
                 activities.synthesize_report_activity,
                 activities.persist_final_item_activity,

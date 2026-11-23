@@ -22,6 +22,7 @@ from app.domain import (
     ResearchPlan,
     ResearchProgress,
     ResearchRunRecord,
+    TurnResponse,
 )
 from app.events import ThreadEvent, ThreadEventBus, ThreadEventKind
 from app.research.openai_client import ResearchLLMClient
@@ -137,6 +138,7 @@ class PersistFinalItemInput(BaseModel):
     text: str
     sub_questions: list[str] = Field(default_factory=list)
     error: str | None = None
+    record_research_run: bool = True
 
 
 class PublishTurnEndInput(BaseModel):
@@ -335,6 +337,12 @@ class ThreadActivities:
             params.query, conversation_id=params.conversation_id
         )
 
+    @activity.defn(name="resolve_turn_activity")
+    async def resolve_turn_activity(self, params: PlanResearchInput) -> TurnResponse:
+        return await self._client.resolve_turn(
+            params.query, conversation_id=params.conversation_id
+        )
+
     @activity.defn(name="investigate_sub_question_activity")
     async def investigate_sub_question_activity(
         self, params: GatherFindingInput
@@ -493,16 +501,17 @@ class ThreadActivities:
             content=[AssistantMessageContent(text=params.text)],
         )
         await self._store.save_item(params.thread_id, item, RequestContext())
-        await self._store.upsert_research_run(
-            thread_id=params.thread_id,
-            workflow_id=params.turn_id,
-            query=params.query,
-            phase=params.phase,
-            message=params.message,
-            sub_questions=params.sub_questions,
-            report=params.text if params.phase != ResearchPhase.FAILED else None,
-            error=params.error,
-        )
+        if params.record_research_run:
+            await self._store.upsert_research_run(
+                thread_id=params.thread_id,
+                workflow_id=params.turn_id,
+                query=params.query,
+                phase=params.phase,
+                message=params.message,
+                sub_questions=params.sub_questions,
+                report=params.text if params.phase != ResearchPhase.FAILED else None,
+                error=params.error,
+            )
         await self._publish(
             thread_id=params.thread_id,
             turn_id=params.turn_id,
