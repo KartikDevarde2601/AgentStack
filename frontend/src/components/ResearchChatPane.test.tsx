@@ -1,5 +1,6 @@
-import { act, render, screen } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import * as threadsApi from '../api/threads';
 import { ResearchChatPane } from './ResearchChatPane';
 
 type CapturedChatKitOptions = {
@@ -36,9 +37,18 @@ vi.mock('@openai/chatkit-react', () => ({
 describe('ResearchChatPane', () => {
   beforeEach(() => {
     latestOptions = {};
-    setThreadIdMock.mockClear();
-    fetchUpdatesMock.mockClear();
-    sendCustomActionMock.mockClear();
+    vi.restoreAllMocks();
+    setThreadIdMock.mockReset().mockResolvedValue(undefined);
+    fetchUpdatesMock.mockReset().mockResolvedValue(undefined);
+    sendCustomActionMock.mockReset().mockResolvedValue(undefined);
+    vi.spyOn(threadsApi, 'getThreadState').mockResolvedValue({
+      thread_id: 'thr_active',
+      openai_conversation_id: 'conv_1',
+      phase: 'researching',
+      active_turn_id: 'turn_1',
+      message: 'Researching...',
+      queued_messages: [],
+    });
   });
 
   it('calls sendCustomAction(research.resume) only after onReady and onThreadLoadEnd for an active thread', () => {
@@ -107,27 +117,90 @@ describe('ResearchChatPane', () => {
     expect(sendCustomActionMock).not.toHaveBeenCalled();
   });
 
-  it('hides the fallback banner once the resumed native stream fires onResponseStart', () => {
+  it('shows MidTurnControlBar during active turns, queues messages as removable chips, and supports steering', async () => {
+    const sendSpy = vi
+      .spyOn(threadsApi, 'sendTurnMessage')
+      .mockResolvedValueOnce({
+        message_id: 'msg_q1',
+        mode: 'queue',
+        state: {
+          thread_id: 'thr_active',
+          openai_conversation_id: 'conv_1',
+          phase: 'researching',
+          active_turn_id: 'turn_1',
+          message: 'Researching...',
+          queued_messages: [
+            {
+              message_id: 'msg_q1',
+              text: 'Also check cost',
+              created_at: new Date().toISOString(),
+            },
+          ],
+        },
+      })
+      .mockResolvedValueOnce({
+        message_id: 'msg_s1',
+        mode: 'steer',
+        state: {
+          thread_id: 'thr_active',
+          openai_conversation_id: 'conv_1',
+          phase: 'planning',
+          active_turn_id: 'turn_2',
+          message: 'Planning...',
+          queued_messages: [],
+        },
+      });
+    const cancelSpy = vi
+      .spyOn(threadsApi, 'cancelQueuedMessage')
+      .mockResolvedValue({
+        thread_id: 'thr_active',
+        openai_conversation_id: 'conv_1',
+        phase: 'researching',
+        active_turn_id: 'turn_1',
+        message: 'Researching...',
+        queued_messages: [],
+      });
+
     render(
       <ResearchChatPane
         activeThreadId="thr_active"
-        activeThreadPhase="synthesizing"
-        isStreamingLocally={false}
+        activeThreadPhase="researching"
+        isStreamingLocally={true}
         onThreadChange={vi.fn()}
         onResponseStart={vi.fn()}
         onResponseEnd={vi.fn()}
       />,
     );
 
-    expect(screen.getByRole('status')).toBeInTheDocument();
+    const input = screen.getByLabelText('Mid-turn message');
+    fireEvent.change(input, { target: { value: 'Also check cost' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Queue' }));
 
-    act(() => {
-      latestOptions.onReady?.();
-      latestOptions.onThreadLoadEnd?.({ threadId: 'thr_active' });
-      latestOptions.onResponseStart?.();
+    await waitFor(() => {
+      expect(sendSpy).toHaveBeenCalledWith(
+        'thr_active',
+        'Also check cost',
+        'queue',
+      );
+      expect(screen.getByText('Also check cost')).toBeInTheDocument();
     });
 
-    expect(screen.queryByRole('status')).not.toBeInTheDocument();
+    fireEvent.click(
+      screen.getByRole('button', {
+        name: 'Cancel queued message: Also check cost',
+      }),
+    );
+    await waitFor(() => {
+      expect(cancelSpy).toHaveBeenCalledWith('thr_active', 'msg_q1');
+      expect(screen.queryByText('Also check cost')).not.toBeInTheDocument();
+    });
+
+    fireEvent.change(input, { target: { value: 'Pivot now' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Steer' }));
+
+    await waitFor(() => {
+      expect(sendSpy).toHaveBeenCalledWith('thr_active', 'Pivot now', 'steer');
+    });
   });
 
   it('re-attaches via sendCustomAction when switching away and back to an active thread', () => {

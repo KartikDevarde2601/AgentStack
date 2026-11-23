@@ -442,6 +442,33 @@ class PostgresChatKitStore(Store[RequestContext]):
                 rows = await cur.fetchall()
         return [_row_to_run_record(row) for row in rows]
 
+    async def get_openai_conversation_id(self, thread_id: str) -> str | None:
+        async with self._pool.connection() as conn:
+            async with conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute(
+                    "SELECT openai_conversation_id FROM chatkit_threads WHERE id = %s",
+                    (thread_id,),
+                )
+                row = await cur.fetchone()
+        if row is None:
+            return None
+        return row["openai_conversation_id"]
+
+    async def set_openai_conversation_id(
+        self, thread_id: str, conversation_id: str
+    ) -> None:
+        async with self._pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    UPDATE chatkit_threads
+                    SET openai_conversation_id = %s, updated_at = %s
+                    WHERE id = %s
+                    """,
+                    (conversation_id, datetime.now(UTC), thread_id),
+                )
+            await conn.commit()
+
     async def list_active_research_runs(self) -> list[ResearchRunRecord]:
         async with self._pool.connection() as conn:
             async with conn.cursor(row_factory=dict_row) as cur:
@@ -449,10 +476,15 @@ class PostgresChatKitStore(Store[RequestContext]):
                     """
                     SELECT *
                     FROM research_runs
-                    WHERE phase NOT IN (%s, %s)
+                    WHERE phase NOT IN (%s, %s, %s, %s)
                     ORDER BY created_at DESC
                     """,
-                    (ResearchPhase.COMPLETED.value, ResearchPhase.FAILED.value),
+                    (
+                        ResearchPhase.IDLE.value,
+                        ResearchPhase.COMPLETED.value,
+                        ResearchPhase.INTERRUPTED.value,
+                        ResearchPhase.FAILED.value,
+                    ),
                 )
                 rows = await cur.fetchall()
         return [_row_to_run_record(row) for row in rows]

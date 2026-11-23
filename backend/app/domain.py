@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Literal
 
@@ -12,17 +12,24 @@ class RequestContext(BaseModel):
 
 
 class ResearchPhase(StrEnum):
+    IDLE = "idle"
     QUEUED = "queued"
     PLANNING = "planning"
     AWAITING_APPROVAL = "awaiting_approval"
     RESEARCHING = "researching"
     SYNTHESIZING = "synthesizing"
     COMPLETED = "completed"
+    INTERRUPTED = "interrupted"
     FAILED = "failed"
 
     @property
     def is_terminal(self) -> bool:
-        return self in (ResearchPhase.COMPLETED, ResearchPhase.FAILED)
+        return self in (
+            ResearchPhase.IDLE,
+            ResearchPhase.COMPLETED,
+            ResearchPhase.INTERRUPTED,
+            ResearchPhase.FAILED,
+        )
 
 
 class ApprovalDecision(BaseModel):
@@ -57,6 +64,39 @@ class ResearchProgress(BaseModel):
     approval_decision: ApprovalDecision | None = None
     report: str | None = None
     error: str | None = None
+
+
+class QueuedMessage(BaseModel):
+    message_id: str
+    text: str
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    already_persisted: bool = False
+
+
+class IncomingMessage(BaseModel):
+    message_id: str
+    text: str
+    mode: Literal["queue", "steer"] = "queue"
+    already_persisted: bool = False
+
+
+class PendingApproval(BaseModel):
+    turn_id: str
+    approval_id: str
+    openai_call_id: str | None = None
+    sub_questions: list[str] = Field(default_factory=list)
+    widget_item_id: str
+
+
+class ThreadWorkflowState(BaseModel):
+    thread_id: str
+    openai_conversation_id: str | None = None
+    phase: ResearchPhase = ResearchPhase.IDLE
+    active_turn_id: str | None = None
+    message: str = ""
+    queued_messages: list[QueuedMessage] = Field(default_factory=list)
+    pending_approval: PendingApproval | None = None
+    turns_since_continue: int = 0
 
 
 class ThreadSummary(BaseModel):

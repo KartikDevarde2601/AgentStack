@@ -2,273 +2,413 @@ from __future__ import annotations
 
 import asyncio
 import uuid
+from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime
 
 import pytest
-from temporalio import activity
+from chatkit.types import AssistantMessageItem, ThreadItem, UserMessageItem, WidgetItem
 from temporalio.contrib.pydantic import pydantic_data_converter
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
 
 from app.domain import (
     ApprovalDecision,
+    IncomingMessage,
+    RequestContext,
     ResearchFinding,
     ResearchPhase,
     ResearchPlan,
-    ResearchProgress,
+    ResearchRunRecord,
 )
-from app.research.openai_client import OpenAIResearchClient
-from app.temporal.activities import (
-    GatherFindingInput,
-    ResearchActivities,
-    SynthesizeReportInput,
-)
-from app.temporal.workflows import DeepResearchWorkflow
+from app.events import InMemoryThreadEventBus, ThreadEventKind
+from app.temporal.activities import ThreadActivities
+from app.temporal.orchestrator import TemporalThreadOrchestrator, thread_workflow_id
+from app.temporal.workflows import AgentThreadInput, AgentThreadWorkflow
 
 
-@pytest.mark.asyncio
-async def test_deep_research_workflow_end_to_end() -> None:
-    async with await WorkflowEnvironment.start_time_skipping(
-        data_converter=pydantic_data_converter
-    ) as env:
-        task_queue = f"test-research-{uuid.uuid4().hex[:8]}"
-        activities = ResearchActivities(OpenAIResearchClient(api_key=""))
+class FakeThreadStore:
+    def __init__(self) -> None:
+        self.conversations: dict[str, str] = {}
+        self.items: dict[str, list[ThreadItem]] = {}
+        self.runs: dict[str, ResearchRunRecord] = {}
 
-        async with Worker(
-            env.client,
-            task_queue=task_queue,
-            workflows=[DeepResearchWorkflow],
-            activities=[
-                activities.plan_research_activity,
-                activities.gather_finding_activity,
-                activities.synthesize_report_activity,
+    async def get_openai_conversation_id(self, thread_id: str) -> str | None:
+        return self.conversations.get(thread_id)
+
+    async def set_openai_conversation_id(
+        self, thread_id: str, conversation_id: str
+    ) -> None:
+        self.conversations[thread_id] = conversation_id
+
+    async def save_item(
+        self, thread_id: str, item: ThreadItem, context: RequestContext
+    ) -> None:
+        bucket = self.items.setdefault(thread_id, [])
+        for idx, existing in enumerate(bucket):
+            if existing.id == item.id:
+                bucket[idx] = item
+                return
+        bucket.append(item)
+
+    async def upsert_research_run(
+        self,
+        *,
+        thread_id: str,
+        workflow_id: str,
+        query: str,
+        phase: ResearchPhase,
+        message: str,
+        sub_questions: list[str] | None = None,
+        report: str | None = None,
+        error: str | None = None,
+    ) -> ResearchRunRecord:
+        now = datetime.now(UTC)
+        record = ResearchRunRecord(
+            id=f"run_{workflow_id}",
+            thread_id=thread_id,
+            workflow_id=workflow_id,
+            query=query,
+            phase=phase,
+            message=message,
+            sub_questions=sub_questions or [],
+            report=report,
+            error=error,
+            created_at=now,
+            updated_at=now,
+        )
+        self.runs[workflow_id] = record
+        return record
+
+
+class FakeResearchLLMClient:
+    def __init__(
+        self,
+        *,
+        investigate_gate: asyncio.Event | None = None,
+        investigate_started: asyncio.Event | None = None,
+    ) -> None:
+        self.created_conversations: list[str] = []
+        self.closed_tool_calls: list[tuple[str, list[str]]] = []
+        self.investigated: list[tuple[str, str, str]] = []
+        self._investigate_gate = investigate_gate
+        self._investigate_started = investigate_started
+
+    async def create_conversation(self) -> str:
+        conv_id = f"conv_{uuid.uuid4().hex[:8]}"
+        self.created_conversations.append(conv_id)
+        return conv_id
+
+    async def close_dangling_tool_calls(
+        self, conversation_id: str, call_ids: list[str]
+    ) -> None:
+        self.closed_tool_calls.append((conversation_id, list(call_ids)))
+
+    async def generate_research_plan(
+        self, query: str, *, conversation_id: str | None = None
+    ) -> ResearchPlan:
+        return ResearchPlan(
+            query=query,
+            sub_questions=[
+                f"Sub-question 1 for {query}",
+                f"Sub-question 2 for {query}",
             ],
-        ):
-            workflow_id = f"wf-{uuid.uuid4().hex[:8]}"
-            query = "How does Temporal guarantee durable execution?"
-            handle = await env.client.start_workflow(
-                DeepResearchWorkflow.run,
-                query,
-                id=workflow_id,
-                task_queue=task_queue,
-            )
-
-            result: ResearchProgress = await handle.result()
-            queried: ResearchProgress = await handle.query(
-                DeepResearchWorkflow.get_progress
-            )
-
-            assert result.workflow_id == workflow_id
-            assert result.query == query
-            assert result.phase == ResearchPhase.COMPLETED
-            assert len(result.sub_questions) == 3
-            assert result.completed_sub_questions == 3
-            assert result.total_sub_questions == 3
-            assert result.error is None
-            assert result.report is not None
-            assert f"# Deep Research Report: {query}" in result.report
-            assert "## Executive Summary" in result.report
-            assert "## Sources" in result.report
-
-            assert queried.phase == ResearchPhase.COMPLETED
-            assert queried.report == result.report
-
-
-@pytest.mark.asyncio
-async def test_deep_research_workflow_phase_transitions() -> None:
-    observed_phases: list[ResearchPhase] = []
-    release_plan = asyncio.Event()
-    in_plan = asyncio.Event()
-    release_research = asyncio.Event()
-    in_research = asyncio.Event()
-    release_synth = asyncio.Event()
-    in_synth = asyncio.Event()
-
-    demo_client = OpenAIResearchClient(api_key="")
-
-    @activity.defn(name="plan_research_activity")
-    async def gated_plan(query: str) -> ResearchPlan:
-        in_plan.set()
-        await release_plan.wait()
-        return await demo_client.generate_research_plan(query)
-
-    @activity.defn(name="gather_finding_activity")
-    async def gated_gather(params: GatherFindingInput) -> ResearchFinding:
-        in_research.set()
-        await release_research.wait()
-        return await demo_client.investigate_sub_question(
-            params.query, params.sub_question
         )
 
-    @activity.defn(name="synthesize_report_activity")
-    async def gated_synth(params: SynthesizeReportInput) -> str:
-        in_synth.set()
-        await release_synth.wait()
-        return await demo_client.synthesize_report(params.query, params.findings)
+    async def investigate_sub_question(
+        self,
+        query: str,
+        sub_question: str,
+        *,
+        depth: str = "standard",
+        conversation_id: str | None = None,
+    ) -> ResearchFinding:
+        if self._investigate_started is not None:
+            self._investigate_started.set()
+        if self._investigate_gate is not None:
+            await self._investigate_gate.wait()
+        self.investigated.append((query, sub_question, depth))
+        return ResearchFinding(
+            sub_question=sub_question,
+            summary=f"Summary of {sub_question}",
+            key_points=[f"Point A ({depth})"],
+            sources=["https://example.com/source"],
+        )
 
-    async with await WorkflowEnvironment.start_time_skipping(
-        data_converter=pydantic_data_converter
-    ) as env:
-        task_queue = f"test-phases-{uuid.uuid4().hex[:8]}"
-        async with Worker(
-            env.client,
-            task_queue=task_queue,
-            workflows=[DeepResearchWorkflow],
-            activities=[gated_plan, gated_gather, gated_synth],
-        ):
-            handle = await env.client.start_workflow(
-                DeepResearchWorkflow.run,
-                "Event-driven architectures",
-                id=f"wf-phases-{uuid.uuid4().hex[:8]}",
-                task_queue=task_queue,
-            )
-
-            await in_plan.wait()
-            observed_phases.append(
-                (await handle.query(DeepResearchWorkflow.get_progress)).phase
-            )
-            release_plan.set()
-
-            await in_research.wait()
-            observed_phases.append(
-                (await handle.query(DeepResearchWorkflow.get_progress)).phase
-            )
-            release_research.set()
-
-            await in_synth.wait()
-            observed_phases.append(
-                (await handle.query(DeepResearchWorkflow.get_progress)).phase
-            )
-            release_synth.set()
-
-            final = await handle.result()
-            observed_phases.append(final.phase)
-
-            assert observed_phases == [
-                ResearchPhase.PLANNING,
-                ResearchPhase.RESEARCHING,
-                ResearchPhase.SYNTHESIZING,
-                ResearchPhase.COMPLETED,
-            ]
+    async def synthesize_report_stream(
+        self,
+        query: str,
+        findings: list[ResearchFinding],
+        *,
+        conversation_id: str | None = None,
+        on_delta: Callable[[str], Awaitable[None]] | None = None,
+    ) -> str:
+        parts = [f"# Report: {query}\n\n", f"Synthesized {len(findings)} findings."]
+        for chunk in parts:
+            if on_delta is not None:
+                await on_delta(chunk)
+        return "".join(parts)
 
 
-@pytest.mark.asyncio
-async def test_deep_research_workflow_handles_activity_failure() -> None:
-    @activity.defn(name="plan_research_activity")
-    async def failing_plan(query: str) -> ResearchPlan:
-        raise RuntimeError("planner exploded")
-
-    @activity.defn(name="gather_finding_activity")
-    async def noop_gather(params: GatherFindingInput) -> ResearchFinding:
-        raise AssertionError("should not run")
-
-    @activity.defn(name="synthesize_report_activity")
-    async def noop_synth(params: SynthesizeReportInput) -> str:
-        raise AssertionError("should not run")
-
-    async with await WorkflowEnvironment.start_time_skipping(
-        data_converter=pydantic_data_converter
-    ) as env:
-        task_queue = f"test-fail-{uuid.uuid4().hex[:8]}"
-        async with Worker(
-            env.client,
-            task_queue=task_queue,
-            workflows=[DeepResearchWorkflow],
-            activities=[failing_plan, noop_gather, noop_synth],
-        ):
-            handle = await env.client.start_workflow(
-                DeepResearchWorkflow.run,
-                "Broken query",
-                id=f"wf-fail-{uuid.uuid4().hex[:8]}",
-                task_queue=task_queue,
-            )
-            result: ResearchProgress = await handle.result()
-            assert result.phase == ResearchPhase.FAILED
-            assert result.error is not None
-            assert result.report is None
+def _all_activities(activities: ThreadActivities) -> list:
+    return [
+        activities.ensure_openai_conversation_activity,
+        activities.close_dangling_tool_calls_activity,
+        activities.persist_user_message_activity,
+        activities.publish_progress_activity,
+        activities.persist_approval_widget_activity,
+        activities.plan_research_activity,
+        activities.investigate_sub_question_activity,
+        activities.synthesize_report_activity,
+        activities.persist_interrupted_or_final_activity,
+        activities.publish_turn_end_activity,
+        activities.prune_thread_events_activity,
+    ]
 
 
 @pytest.mark.asyncio
-async def test_deep_research_workflow_hitl_approval_and_rejection() -> None:
+async def test_agent_thread_workflow_approval_streaming_and_queue() -> None:
+    store = FakeThreadStore()
+    bus = InMemoryThreadEventBus()
+    llm = FakeResearchLLMClient()
+    activities = ThreadActivities(client=llm, store=store, event_bus=bus)
+
     async with await WorkflowEnvironment.start_time_skipping(
         data_converter=pydantic_data_converter
     ) as env:
-        task_queue = f"test-hitl-{uuid.uuid4().hex[:8]}"
-        activities = ResearchActivities(OpenAIResearchClient(api_key=""))
-
+        task_queue = f"test-entity-{uuid.uuid4().hex[:8]}"
+        orchestrator = TemporalThreadOrchestrator(
+            env.client, task_queue=task_queue, require_approval=True
+        )
         async with Worker(
             env.client,
             task_queue=task_queue,
-            workflows=[DeepResearchWorkflow],
-            activities=[
-                activities.plan_research_activity,
-                activities.gather_finding_activity,
-                activities.synthesize_report_activity,
-            ],
+            workflows=[AgentThreadWorkflow],
+            activities=_all_activities(activities),
         ):
-            # 1. Approve flow with edited sub-questions + extra focus
-            approve_id = f"wf-hitl-ok-{uuid.uuid4().hex[:8]}"
-            handle = await env.client.start_workflow(
-                DeepResearchWorkflow.run,
-                args=["Postgres vs SQLite", True],
-                id=approve_id,
-                task_queue=task_queue,
-            )
-
-            progress = await handle.query(DeepResearchWorkflow.get_progress)
-            for _ in range(50):
-                if progress.phase == ResearchPhase.AWAITING_APPROVAL:
-                    break
-                await asyncio.sleep(0.02)
-                progress = await handle.query(DeepResearchWorkflow.get_progress)
-
-            assert progress.phase == ResearchPhase.AWAITING_APPROVAL
-            assert len(progress.sub_questions) == 3
-
-            await handle.signal(
-                DeepResearchWorkflow.submit_approval,
-                ApprovalDecision(
-                    approved=True,
-                    sub_questions=progress.sub_questions[:1],
-                    depth="deep",
-                    extra_focus="Operational backup and restore tradeoffs",
+            thread_id = f"thr_{uuid.uuid4().hex[:8]}"
+            await orchestrator.send_message(
+                thread_id,
+                IncomingMessage(
+                    message_id="msg_1",
+                    text="Compare Postgres and SQLite",
+                    already_persisted=True,
                 ),
             )
 
-            result = await handle.result()
-            assert result.phase == ResearchPhase.COMPLETED
-            assert len(result.sub_questions) == 2
-            assert "Operational backup and restore tradeoffs" in result.sub_questions
-            assert len(result.findings) == 2
-            assert result.report is not None
-
-            # 2. Reject flow cancels cleanly without running research activities
-            reject_id = f"wf-hitl-no-{uuid.uuid4().hex[:8]}"
-            reject_handle = await env.client.start_workflow(
-                DeepResearchWorkflow.run,
-                args=["Rejected topic", True],
-                id=reject_id,
-                task_queue=task_queue,
-            )
-
-            rej_progress = await reject_handle.query(DeepResearchWorkflow.get_progress)
-            for _ in range(50):
-                if rej_progress.phase == ResearchPhase.AWAITING_APPROVAL:
+            # Wait until Turn 1 pauses at the Approval Gate.
+            state = await orchestrator.get_state(thread_id)
+            for _ in range(100):
+                if state.phase == ResearchPhase.AWAITING_APPROVAL:
                     break
                 await asyncio.sleep(0.02)
-                rej_progress = await reject_handle.query(
-                    DeepResearchWorkflow.get_progress
-                )
-            assert rej_progress.phase == ResearchPhase.AWAITING_APPROVAL
+                state = await orchestrator.get_state(thread_id)
 
-            await reject_handle.signal(
-                DeepResearchWorkflow.submit_approval,
-                ApprovalDecision(approved=False, reason="Not needed"),
+            assert state.phase == ResearchPhase.AWAITING_APPROVAL
+            assert state.pending_approval is not None
+            assert state.openai_conversation_id is not None
+
+            # Approve Turn 1 with edited sub-questions + extra focus.
+            await orchestrator.submit_approval(
+                thread_id,
+                ApprovalDecision(
+                    approved=True,
+                    sub_questions=state.pending_approval.sub_questions[:1],
+                    depth="deep",
+                    extra_focus="WAL mode tradeoffs",
+                ),
             )
 
-            rejected = await reject_handle.result()
-            assert rejected.phase == ResearchPhase.COMPLETED
-            assert rejected.approval_decision is not None
-            assert rejected.approval_decision.approved is False
-            assert rejected.findings == []
-            assert rejected.report is not None
-            assert "Research Cancelled" in rejected.report
+            # Wait for Turn 1 to finish and workflow to return to IDLE.
+            for _ in range(100):
+                state = await orchestrator.get_state(thread_id)
+                if state.phase == ResearchPhase.IDLE:
+                    break
+                await asyncio.sleep(0.02)
+
+            assert state.phase == ResearchPhase.IDLE
+            assert state.turns_since_continue == 1
+
+            # Verify live streaming deltas were emitted to ThreadEventBus.
+            events = [ev for ev in bus._events_by_thread[thread_id]]
+            assert any(ev.kind == ThreadEventKind.APPROVAL_PAUSE for ev in events)
+            assert any(ev.kind == ThreadEventKind.TEXT_DELTA for ev in events)
+            assert any(ev.kind == ThreadEventKind.TURN_END for ev in events)
+
+            # Verify findings and final report were persisted by activities.
+            items = store.items[thread_id]
+            assistant_items = [i for i in items if isinstance(i, AssistantMessageItem)]
+            assert len(assistant_items) == 1
+            assert "# Report: Compare Postgres and SQLite" in assistant_items[0].content[0].text
+            assert any(sub == "WAL mode tradeoffs" for _, sub, _ in llm.investigated)
+
+
+@pytest.mark.asyncio
+async def test_agent_thread_workflow_steer_closes_call_ids_and_preserves_interrupted() -> None:
+    store = FakeThreadStore()
+    bus = InMemoryThreadEventBus()
+    llm = FakeResearchLLMClient()
+    activities = ThreadActivities(client=llm, store=store, event_bus=bus)
+
+    async with await WorkflowEnvironment.start_time_skipping(
+        data_converter=pydantic_data_converter
+    ) as env:
+        task_queue = f"test-steer-{uuid.uuid4().hex[:8]}"
+        orchestrator = TemporalThreadOrchestrator(
+            env.client, task_queue=task_queue, require_approval=True
+        )
+        async with Worker(
+            env.client,
+            task_queue=task_queue,
+            workflows=[AgentThreadWorkflow],
+            activities=_all_activities(activities),
+        ):
+            thread_id = f"thr_{uuid.uuid4().hex[:8]}"
+            await orchestrator.send_message(
+                thread_id,
+                IncomingMessage(
+                    message_id="msg_1",
+                    text="Initial topic",
+                    already_persisted=True,
+                ),
+            )
+
+            state = await orchestrator.get_state(thread_id)
+            for _ in range(100):
+                if state.phase == ResearchPhase.AWAITING_APPROVAL:
+                    break
+                await asyncio.sleep(0.02)
+                state = await orchestrator.get_state(thread_id)
+
+            assert state.pending_approval is not None
+            expected_approval_id = state.pending_approval.approval_id
+
+            # Steer while parked at Approval Gate!
+            await orchestrator.send_message(
+                thread_id,
+                IncomingMessage(
+                    message_id="msg_steer",
+                    text="Pivot to Temporal signals",
+                    mode="steer",
+                    already_persisted=False,
+                ),
+            )
+
+            # Wait for the steering Turn to reach its own Approval Gate.
+            for _ in range(100):
+                state = await orchestrator.get_state(thread_id)
+                if (
+                    state.phase == ResearchPhase.AWAITING_APPROVAL
+                    and state.pending_approval is not None
+                    and state.pending_approval.approval_id != expected_approval_id
+                ):
+                    break
+                await asyncio.sleep(0.02)
+
+            # No fabricated OpenAI call_ids are sent to conversations.items.create.
+            assert llm.closed_tool_calls == []
+
+            # Verify interrupted partial output was preserved and steering user message was persisted.
+            items = store.items[thread_id]
+            interrupted_items = [
+                i
+                for i in items
+                if isinstance(i, AssistantMessageItem)
+                and "Research Interrupted" in i.content[0].text
+            ]
+            assert len(interrupted_items) == 1
+            user_items = [
+                i
+                for i in items
+                if isinstance(i, UserMessageItem) and i.id == "msg_steer"
+            ]
+            assert len(user_items) == 1
+
+            # Reject the second plan to end cleanly.
+            await orchestrator.submit_approval(
+                thread_id, ApprovalDecision(approved=False, reason="Done testing")
+            )
+            for _ in range(100):
+                state = await orchestrator.get_state(thread_id)
+                if state.phase == ResearchPhase.IDLE:
+                    break
+                await asyncio.sleep(0.02)
+            assert state.phase == ResearchPhase.IDLE
+
+
+@pytest.mark.asyncio
+async def test_agent_thread_workflow_queue_cancel_and_idle_prune() -> None:
+    investigate_started = asyncio.Event()
+    investigate_gate = asyncio.Event()
+    store = FakeThreadStore()
+    bus = InMemoryThreadEventBus()
+    llm = FakeResearchLLMClient(
+        investigate_gate=investigate_gate,
+        investigate_started=investigate_started,
+    )
+    activities = ThreadActivities(client=llm, store=store, event_bus=bus)
+
+    async with await WorkflowEnvironment.start_time_skipping(
+        data_converter=pydantic_data_converter
+    ) as env:
+        task_queue = f"test-queue-{uuid.uuid4().hex[:8]}"
+        async with Worker(
+            env.client,
+            task_queue=task_queue,
+            workflows=[AgentThreadWorkflow],
+            activities=_all_activities(activities),
+        ):
+            thread_id = f"thr_{uuid.uuid4().hex[:8]}"
+            wf_id = thread_workflow_id(thread_id)
+            handle = await env.client.start_workflow(
+                AgentThreadWorkflow.run,
+                AgentThreadInput(
+                    thread_id=thread_id,
+                    require_approval=False,
+                    idle_timeout_seconds=1800,
+                ),
+                id=wf_id,
+                task_queue=task_queue,
+                start_signal="enqueue_message",
+                start_signal_args=[
+                    IncomingMessage(
+                        message_id="msg_1",
+                        text="Turn 1",
+                        already_persisted=True,
+                    )
+                ],
+            )
+
+            await investigate_started.wait()
+
+            # Queue two follow-up messages while Turn 1 is actively researching.
+            await handle.signal(
+                AgentThreadWorkflow.enqueue_message,
+                IncomingMessage(message_id="msg_drop", text="Drop me"),
+            )
+            await handle.signal(
+                AgentThreadWorkflow.enqueue_message,
+                IncomingMessage(message_id="msg_keep", text="Turn 2"),
+            )
+
+            # Cancel msg_drop before Turn 1 finishes.
+            await handle.signal(AgentThreadWorkflow.cancel_queued, "msg_drop")
+            state = await handle.query(AgentThreadWorkflow.get_state)
+            assert [m.message_id for m in state.queued_messages] == ["msg_keep"]
+
+            # msg_keep must NOT be persisted in chatkit_items yet (Q5).
+            assert not any(
+                isinstance(i, UserMessageItem) and i.id == "msg_keep"
+                for i in store.items.get(thread_id, [])
+            )
+
+            # Release Turn 1; Turn 2 should run next, then idle-exit after 30m (time-skipped) and prune run_events.
+            investigate_gate.set()
+            await handle.result()
+
+            items = store.items[thread_id]
+            user_ids = [i.id for i in items if isinstance(i, UserMessageItem)]
+            assert "msg_keep" in user_ids
+            assert "msg_drop" not in user_ids
+
+            # Idle-exit prunes ephemeral run_events for this thread (Q7).
+            assert await bus.latest_seq(thread_id) == 0
