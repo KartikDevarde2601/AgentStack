@@ -22,6 +22,7 @@ from app.domain import (
     ResearchPlan,
     ResearchRunRecord,
     ThreadSummary,
+    TurnResponse,
 )
 from app.events import InMemoryThreadEventBus
 from app.main import create_app
@@ -254,6 +255,11 @@ class FakeLLM:
             sub_questions=[f"Architecture of {query}", f"Tradeoffs of {query}"],
         )
 
+    async def resolve_turn(
+        self, query: str, *, conversation_id: str | None = None
+    ) -> TurnResponse:
+        return await self.generate_research_plan(query, conversation_id=conversation_id)
+
     async def investigate_sub_question(
         self,
         query: str,
@@ -300,6 +306,7 @@ def _worker_activities(activities: ThreadActivities) -> list:
         activities.publish_progress_activity,
         activities.persist_approval_widget_activity,
         activities.plan_research_activity,
+        activities.resolve_turn_activity,
         activities.investigate_sub_question_activity,
         activities.synthesize_report_activity,
         activities.persist_final_item_activity,

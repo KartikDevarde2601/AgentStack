@@ -13,12 +13,14 @@ from temporalio.worker import Worker
 
 from app.domain import (
     ApprovalDecision,
+    ConversationReply,
     IncomingMessage,
     RequestContext,
     ResearchFinding,
     ResearchPhase,
     ResearchPlan,
     ResearchRunRecord,
+    TurnResponse,
 )
 from app.events import InMemoryThreadEventBus, ThreadEventKind
 from app.temporal.activities import ThreadActivities
@@ -106,6 +108,11 @@ class FakeResearchLLMClient:
             ],
         )
 
+    async def resolve_turn(
+        self, query: str, *, conversation_id: str | None = None
+    ) -> TurnResponse:
+        return await self.generate_research_plan(query, conversation_id=conversation_id)
+
     async def investigate_sub_question(
         self,
         query: str,
@@ -145,12 +152,91 @@ def _all_activities(activities: ThreadActivities) -> list:
         activities.publish_progress_activity,
         activities.persist_approval_widget_activity,
         activities.plan_research_activity,
+        activities.resolve_turn_activity,
         activities.investigate_sub_question_activity,
         activities.synthesize_report_activity,
         activities.persist_final_item_activity,
         activities.publish_turn_end_activity,
         activities.prune_thread_events_activity,
     ]
+
+
+@pytest.mark.asyncio
+async def test_conversation_replies_skip_research_and_keep_the_same_thread() -> None:
+    class ConversationLLM(FakeResearchLLMClient):
+        async def resolve_turn(
+            self, query: str, *, conversation_id: str | None = None
+        ) -> TurnResponse:
+            assert self.created_conversations == [conversation_id]
+            if query == "What does WAL stand for?":
+                return ConversationReply(kind="answer", text="Write-ahead logging.")
+            if query == "Can you go further?":
+                return ConversationReply(
+                    kind="clarify", text="Would you like an explanation or deep research?"
+                )
+            return await super().resolve_turn(query, conversation_id=conversation_id)
+
+    store = FakeThreadStore()
+    bus = InMemoryThreadEventBus()
+    llm = ConversationLLM()
+    activities = ThreadActivities(client=llm, store=store, event_bus=bus)
+    thread_id = "thr_conversation_replies"
+
+    async with await WorkflowEnvironment.start_time_skipping(
+        data_converter=pydantic_data_converter
+    ) as env:
+        task_queue = f"test-conversation-{uuid.uuid4().hex[:8]}"
+        orchestrator = TemporalThreadOrchestrator(
+            env.client, task_queue=task_queue, require_approval=True
+        )
+        async with Worker(
+            env.client,
+            task_queue=task_queue,
+            workflows=[AgentThreadWorkflow],
+            activities=_all_activities(activities),
+        ):
+            for turn, (query, expected) in enumerate(
+                [
+                    ("What does WAL stand for?", "Write-ahead logging."),
+                    (
+                        "Can you go further?",
+                        "Would you like an explanation or deep research?",
+                    ),
+                ],
+                start=1,
+            ):
+                after_seq = await bus.latest_seq(thread_id)
+                await orchestrator.send_message(
+                    thread_id, IncomingMessage(message_id=f"msg_{turn}", text=query)
+                )
+                kinds = []
+                async with asyncio.timeout(5):
+                    async for event in bus.subscribe(thread_id, after_seq=after_seq):
+                        kinds.append(event.kind)
+                        if event.kind == ThreadEventKind.TURN_END:
+                            break
+                assert ThreadEventKind.APPROVAL_PAUSE not in kinds
+                assert ThreadEventKind.PROGRESS not in kinds
+                reply = store.items[thread_id][-1]
+                assert isinstance(reply, AssistantMessageItem)
+                assert reply.content[0].text == expected
+                async with asyncio.timeout(5):
+                    state = await orchestrator.get_state(thread_id)
+                    while state.phase != ResearchPhase.IDLE:
+                        await asyncio.sleep(0.02)
+                        state = await orchestrator.get_state(thread_id)
+
+            assert not store.runs
+            await orchestrator.send_message(
+                thread_id,
+                IncomingMessage(message_id="msg_3", text="Deep research on WAL, please"),
+            )
+            async with asyncio.timeout(5):
+                state = await orchestrator.get_state(thread_id)
+                while state.phase != ResearchPhase.AWAITING_APPROVAL:
+                    await asyncio.sleep(0.02)
+                    state = await orchestrator.get_state(thread_id)
+            assert not llm.investigated
 
 
 @pytest.mark.asyncio

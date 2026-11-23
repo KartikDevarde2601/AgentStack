@@ -10,12 +10,14 @@ from temporalio.common import RetryPolicy
 with workflow.unsafe.imports_passed_through():
     from app.domain import (
         ApprovalDecision,
+        ConversationReply,
         IncomingMessage,
         PendingApproval,
         ResearchFinding,
         ResearchPhase,
         ResearchPlan,
         ThreadWorkflowState,
+        TurnResponse,
     )
     from app.temporal.activities import (
         GatherFindingInput,
@@ -185,7 +187,13 @@ class AgentThreadWorkflow:
         require_approval: bool,
     ) -> None:
         query = msg.text
-        plan_succeeded = False
+        # Temporal caches patch decisions per workflow run. Scope the marker to
+        # this turn so replaying an older turn does not pin subsequent turns.
+        resolve_turn = workflow.patched(
+            f"resolve-conversation-turn-{self._turns_since_continue}"
+        )
+        response_received = False
+        research_started = not resolve_turn
         try:
             if not msg.already_persisted:
                 await workflow.execute_activity(
@@ -199,6 +207,42 @@ class AgentThreadWorkflow:
                     start_to_close_timeout=timedelta(seconds=30),
                     retry_policy=_ACTIVITY_RETRY,
                 )
+
+            plan_input = PlanResearchInput(
+                query=query, conversation_id=self._openai_conversation_id
+            )
+            if resolve_turn:
+                self._phase = ResearchPhase.PLANNING
+                self._message = "Reading your request..."
+                await self._flush_unrecorded_turns()
+                response = await workflow.execute_activity(
+                    "resolve_turn_activity",
+                    plan_input,
+                    result_type=TurnResponse,
+                    start_to_close_timeout=timedelta(seconds=60),
+                    retry_policy=_ACTIVITY_RETRY,
+                )
+                response_received = True
+                if isinstance(response, ConversationReply):
+                    await workflow.execute_activity(
+                        "persist_final_item_activity",
+                        PersistFinalItemInput(
+                            thread_id=self._thread_id,
+                            turn_id=turn_id,
+                            query=query,
+                            phase=ResearchPhase.COMPLETED,
+                            message="",
+                            text=response.text,
+                            record_research_run=False,
+                        ),
+                        start_to_close_timeout=timedelta(seconds=30),
+                        retry_policy=_ACTIVITY_RETRY,
+                    )
+                    self._phase = ResearchPhase.COMPLETED
+                    self._message = ""
+                    return
+                plan = response
+                research_started = True
 
             self._phase = ResearchPhase.PLANNING
             self._message = "Planning research sub-questions..."
@@ -215,21 +259,17 @@ class AgentThreadWorkflow:
                 retry_policy=_ACTIVITY_RETRY,
             )
 
-            # Flush any earlier failed turns that OpenAI's transactional
-            # responses.create rejected before appending to the Conversation.
-            await self._flush_unrecorded_turns()
-
-            plan: ResearchPlan = await workflow.execute_activity(
-                "plan_research_activity",
-                PlanResearchInput(
-                    query=query,
-                    conversation_id=self._openai_conversation_id,
-                ),
-                result_type=ResearchPlan,
-                start_to_close_timeout=timedelta(seconds=60),
-                retry_policy=_ACTIVITY_RETRY,
-            )
-            plan_succeeded = True
+            if not resolve_turn:
+                # Replay the planner for turns already started by an older worker.
+                await self._flush_unrecorded_turns()
+                plan = await workflow.execute_activity(
+                    "plan_research_activity",
+                    plan_input,
+                    result_type=ResearchPlan,
+                    start_to_close_timeout=timedelta(seconds=60),
+                    retry_policy=_ACTIVITY_RETRY,
+                )
+                response_received = True
             query = plan.query or query
             self._active_query = query
             sub_questions = list(plan.sub_questions)
@@ -473,7 +513,7 @@ class AgentThreadWorkflow:
                 retry_policy=_ACTIVITY_RETRY,
             )
         except Exception as exc:
-            if not plan_succeeded:
+            if not response_received:
                 self._unrecorded_turns.append((query, str(exc)))
                 try:
                     await self._flush_unrecorded_turns(best_effort=True)
@@ -481,7 +521,16 @@ class AgentThreadWorkflow:
                     # Keep in durable workflow state to flush on the next Turn.
                     pass
             self._phase = ResearchPhase.FAILED
-            self._message = f"Deep research failed: {exc}"
+            if research_started:
+                self._message = f"Deep research failed: {exc}"
+                failure_text = (
+                    "### Research Failed\n\n"
+                    f"Unable to complete research for **{query}**.\n\n"
+                    f"Error: `{exc}`"
+                )
+            else:
+                self._message = "Could not respond to your request."
+                failure_text = "I couldn't respond to your request. Please try again."
             await workflow.execute_activity(
                 "persist_final_item_activity",
                 PersistFinalItemInput(
@@ -491,12 +540,9 @@ class AgentThreadWorkflow:
                     phase=ResearchPhase.FAILED,
                     message=self._message,
                     sub_questions=self._active_sub_questions,
-                    text=(
-                        "### Research Failed\n\n"
-                        f"Unable to complete research for **{query}**.\n\n"
-                        f"Error: `{exc}`"
-                    ),
+                    text=failure_text,
                     error=str(exc),
+                    record_research_run=research_started,
                 ),
                 start_to_close_timeout=timedelta(seconds=30),
                 retry_policy=_ACTIVITY_RETRY,

@@ -121,7 +121,7 @@ class DeepResearchChatKitServer(ChatKitServer[RequestContext]):
             yield self._assistant_message_event(
                 thread=thread,
                 context=context,
-                text="Please enter a research question so I can investigate it for you.",
+                text="Please enter a question or tell me what you'd like to research.",
             )
             return
 
@@ -159,7 +159,7 @@ class DeepResearchChatKitServer(ChatKitServer[RequestContext]):
                 thread=thread,
                 context=context,
                 text=(
-                    "A research turn is already in progress for this thread. "
+                    "A response is already in progress for this thread. "
                     "Please wait for it to finish before sending another message."
                 ),
             )
@@ -173,7 +173,7 @@ class DeepResearchChatKitServer(ChatKitServer[RequestContext]):
         )
         yield ProgressUpdateEvent(
             icon="clock",
-            text="Starting deep research turn...",
+            text="Reading your request...",
         )
         await self._orchestrator.send_message(
             thread.id,

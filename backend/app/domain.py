@@ -2,9 +2,9 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import StrEnum
-from typing import Literal
+from typing import Annotated, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StringConstraints
 
 
 class RequestContext(BaseModel):
@@ -43,6 +43,14 @@ class ApprovalDecision(BaseModel):
 class ResearchPlan(BaseModel):
     query: str
     sub_questions: list[str] = Field(default_factory=list)
+
+
+class ConversationReply(BaseModel):
+    kind: Literal["answer", "clarify"]
+    text: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
+
+
+TurnResponse = ResearchPlan | ConversationReply
 
 
 class ResearchFinding(BaseModel):
