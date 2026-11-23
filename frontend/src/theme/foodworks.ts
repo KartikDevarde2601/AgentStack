@@ -5,12 +5,12 @@ export const CHATKIT_FOODWORKS_THEME = {
   radius: 'pill',
   density: 'normal',
   typography: {
-    baseSize: 15,
-    fontFamily: "'Roboto', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
+    baseSize: 17,
+    fontFamily: "'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
     fontSources: [
       {
-        family: 'Roboto',
-        src: 'https://fonts.gstatic.com/s/roboto/v51/KFO7CnqEu92Fr1ME7kSn66aGLdTylUAMa3yUBHMdazQ.woff2',
+        family: 'Inter',
+        src: 'https://fonts.gstatic.com/s/inter/v20/UcC73FwrK3iLTeHuS_nVMrMxCp50SjIa1ZL7W0Q5nw.woff2',
         weight: '400 700',
         display: 'swap',
       },

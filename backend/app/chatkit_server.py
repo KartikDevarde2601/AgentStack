@@ -6,10 +6,10 @@ from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from typing import Any, Literal
 
+from chatkit.actions import Action
 from chatkit.server import ChatKitServer
 from chatkit.store import Store
 from chatkit.types import (
-    Action,
     AssistantMessageContent,
     AssistantMessageContentPartAdded,
     AssistantMessageContentPartDone,
@@ -33,16 +33,19 @@ from pydantic import TypeAdapter
 
 from app.domain import (
     ApprovalDecision,
+    ClarificationSubmission,
     IncomingMessage,
     RequestContext,
     ResearchPhase,
 )
 from app.events import ThreadEventBus, ThreadEventKind
-from app.temporal.orchestrator import ThreadOrchestrator
+from app.temporal.orchestrator import ThreadOrchestrator, WorkflowActionRejectedError
 from app.widgets import (
     APPROVE_PLAN_ACTION,
     FOLLOWUP_ACTION,
     REJECT_PLAN_ACTION,
+    SKIP_CLARIFICATIONS_ACTION,
+    SUBMIT_CLARIFICATIONS_ACTION,
     TOGGLE_FINDING_ACTION,
 )
 
@@ -146,6 +149,16 @@ class DeepResearchChatKitServer(ChatKitServer[RequestContext]):
             return
 
         state = await self._orchestrator.get_state(thread.id)
+        if state.phase == ResearchPhase.AWAITING_CLARIFICATIONS:
+            yield self._assistant_message_event(
+                thread=thread,
+                context=context,
+                text=(
+                    "Please submit or skip the clarifying questions card above "
+                    "before starting a new message."
+                ),
+            )
+            return
         if state.phase == ResearchPhase.AWAITING_APPROVAL:
             yield self._assistant_message_event(
                 thread=thread,
@@ -202,11 +215,22 @@ class DeepResearchChatKitServer(ChatKitServer[RequestContext]):
                 yield event
             return
 
+        if action.type in (SUBMIT_CLARIFICATIONS_ACTION, SKIP_CLARIFICATIONS_ACTION):
+            async for event in self._handle_clarifications_action(
+                thread=thread,
+                skipped=(action.type == SKIP_CLARIFICATIONS_ACTION),
+                payload=payload,
+                context=context,
+            ):
+                yield event
+            return
+
         if action.type in (APPROVE_PLAN_ACTION, REJECT_PLAN_ACTION):
             async for event in self._handle_approval_action(
                 thread=thread,
                 approved=(action.type == APPROVE_PLAN_ACTION),
                 payload=payload,
+                context=context,
             ):
                 yield event
             return
@@ -236,11 +260,67 @@ class DeepResearchChatKitServer(ChatKitServer[RequestContext]):
         if self._orchestrator is None:
             return
         state = await self._orchestrator.get_state(thread.id)
-        if state.phase.is_terminal or state.phase == ResearchPhase.AWAITING_APPROVAL:
+        if state.phase.is_terminal or state.phase in (
+            ResearchPhase.AWAITING_CLARIFICATIONS,
+            ResearchPhase.AWAITING_APPROVAL,
+        ):
             return
         async for event in self._tail_thread_events(
             thread.id, after_seq=0, active_turn_id=state.active_turn_id
         ):
+            yield event
+
+    async def _handle_clarifications_action(
+        self,
+        *,
+        thread: ThreadMetadata,
+        skipped: bool,
+        payload: dict[str, Any],
+        context: RequestContext,
+    ) -> AsyncIterator[ThreadStreamEvent]:
+        if self._orchestrator is None:
+            return
+
+        answers: dict[str, str] = {}
+        if not skipped:
+            raw_questions = payload.get("questions") or []
+            for idx, raw_q in enumerate(raw_questions):
+                if not isinstance(raw_q, dict):
+                    continue
+                q_id = str(raw_q.get("id") or f"q_{idx}")
+                q_kind = str(raw_q.get("kind") or "short_text")
+                if q_kind == "multi_select":
+                    options = raw_q.get("options") or []
+                    selected: list[str] = []
+                    for opt_idx, opt in enumerate(options):
+                        if self._is_truthy_checkbox(
+                            payload.get(f"{q_id}__opt__{opt_idx}")
+                        ):
+                            label = (
+                                str(opt.get("label") or opt.get("value") or "")
+                                if isinstance(opt, dict)
+                                else str(opt)
+                            )
+                            if label:
+                                selected.append(label)
+                    answers[q_id] = ", ".join(selected) if selected else "No preference"
+                else:
+                    val = str(payload.get(q_id) or "").strip()
+                    answers[q_id] = val or "No preference"
+
+        turn_id = str(payload.get("workflow_id") or "").strip() or None
+        submission = ClarificationSubmission(
+            turn_id=turn_id, skipped=skipped, answers=answers
+        )
+        after_seq = await self._event_bus.latest_seq(thread.id)
+        try:
+            await self._orchestrator.submit_clarifications(thread.id, submission)
+        except WorkflowActionRejectedError as exc:
+            yield self._assistant_message_event(
+                thread=thread, context=context, text=str(exc)
+            )
+            return
+        async for event in self._tail_thread_events(thread.id, after_seq=after_seq):
             yield event
 
     async def _handle_approval_action(
@@ -249,6 +329,7 @@ class DeepResearchChatKitServer(ChatKitServer[RequestContext]):
         thread: ThreadMetadata,
         approved: bool,
         payload: dict[str, Any],
+        context: RequestContext,
     ) -> AsyncIterator[ThreadStreamEvent]:
         if self._orchestrator is None:
             return
@@ -273,8 +354,10 @@ class DeepResearchChatKitServer(ChatKitServer[RequestContext]):
             raw_depth if raw_depth in ("concise", "standard", "deep") else "standard"  # type: ignore[assignment]
         )
         extra_focus = str(payload.get("extra_focus") or "").strip()
+        turn_id = str(payload.get("workflow_id") or "").strip() or None
 
         decision = ApprovalDecision(
+            turn_id=turn_id,
             approved=approved,
             sub_questions=selected_questions,
             depth=depth,
@@ -283,7 +366,13 @@ class DeepResearchChatKitServer(ChatKitServer[RequestContext]):
         )
 
         after_seq = await self._event_bus.latest_seq(thread.id)
-        await self._orchestrator.submit_approval(thread.id, decision)
+        try:
+            await self._orchestrator.submit_approval(thread.id, decision)
+        except WorkflowActionRejectedError as exc:
+            yield self._assistant_message_event(
+                thread=thread, context=context, text=str(exc)
+            )
+            return
         async for event in self._tail_thread_events(thread.id, after_seq=after_seq):
             yield event
 
@@ -297,12 +386,16 @@ class DeepResearchChatKitServer(ChatKitServer[RequestContext]):
             return
         mode = str(payload.get("mode") or "executive_summary")
         base_query = str(payload.get("query") or thread.title or "this topic").strip()
+        custom_prompt = str(payload.get("prompt") or "").strip()
         prompts = {
             "executive_summary": f"Provide a concise executive summary and key risks for: {base_query}",
             "deep_dive": f"Do a deeper technical and operational dive into: {base_query}",
             "compare_alternatives": f"Compare the main alternatives and tradeoffs for: {base_query}",
         }
-        prompt = prompts.get(mode, f"Follow up on: {base_query}")
+        if mode == "custom" and custom_prompt:
+            prompt = custom_prompt
+        else:
+            prompt = prompts.get(mode, f"Follow up on: {base_query}")
         state = await self._orchestrator.get_state(thread.id)
         if not state.phase.is_terminal:
             return
@@ -398,9 +491,7 @@ class DeepResearchChatKitServer(ChatKitServer[RequestContext]):
             elif ev.kind == ThreadEventKind.ITEM_REPLACED:
                 item = _THREAD_ITEM_ADAPTER.validate_python(ev.payload["item"])
                 yield ThreadItemReplacedEvent(item=item)
-            elif ev.kind == ThreadEventKind.APPROVAL_PAUSE:
-                return
-            elif ev.kind == ThreadEventKind.TURN_END:
+            elif ev.kind in (ThreadEventKind.APPROVAL_PAUSE, ThreadEventKind.TURN_END):
                 return
 
     def _assistant_message_event(

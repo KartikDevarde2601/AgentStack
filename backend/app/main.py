@@ -55,7 +55,7 @@ def create_app(
             try:
                 await pool.open(wait=True, timeout=5.0)
                 await active_store.initialize()
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 logger.warning("Postgres initialization failed at startup: %s", exc)
 
         if active_event_bus is None:
@@ -72,8 +72,9 @@ def create_app(
                 active_orchestrator = TemporalThreadOrchestrator(
                     client=temporal_client,
                     task_queue=cfg.temporal_task_queue,
+                    model=cfg.openai_model,
                 )
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 logger.warning("Temporal connection unavailable at startup: %s", exc)
 
         chatkit_server = DeepResearchChatKitServer(
@@ -117,12 +118,13 @@ def create_app(
             orch = TemporalThreadOrchestrator(
                 client=client,
                 task_queue=request.app.state.settings.temporal_task_queue,
+                model=request.app.state.settings.openai_model,
             )
             request.app.state.temporal_client = client
             request.app.state.orchestrator = orch
             request.app.state.chatkit_server.set_orchestrator(orch)
             return orch
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             logger.warning("Lazy Temporal reconnect failed: %s", exc)
             return None
 
@@ -159,6 +161,12 @@ def create_app(
         except NotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         await request.app.state.store.delete_thread(thread_id, ctx)
+        orch = request.app.state.orchestrator
+        if orch is not None:
+            try:
+                await orch.end_workflow(thread_id)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Failed to signal end_workflow for %s: %s", thread_id, exc)
         return {"deleted": True, "id": thread_id}
 
     @app.get("/api/threads/{thread_id}/runs")

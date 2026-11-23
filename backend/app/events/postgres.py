@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -53,18 +52,20 @@ class PostgresThreadEventBus:
         return seq
 
     async def _fetch_after(self, thread_id: str, after_seq: int) -> list[ThreadEvent]:
-        async with self._pool.connection() as conn:
-            async with conn.cursor(row_factory=dict_row) as cur:
-                await cur.execute(
-                    """
-                    SELECT seq, thread_id, turn_id, kind, payload, activity_id, attempt, created_at
-                    FROM run_events
-                    WHERE thread_id = %s AND seq > %s
-                    ORDER BY seq ASC
-                    """,
-                    (thread_id, after_seq),
-                )
-                rows = await cur.fetchall()
+        async with (
+            self._pool.connection() as conn,
+            conn.cursor(row_factory=dict_row) as cur,
+        ):
+            await cur.execute(
+                """
+                SELECT seq, thread_id, turn_id, kind, payload, activity_id, attempt, created_at
+                FROM run_events
+                WHERE thread_id = %s AND seq > %s
+                ORDER BY seq ASC
+                """,
+                (thread_id, after_seq),
+            )
+            rows = await cur.fetchall()
         return [
             ThreadEvent(
                 seq=int(r["seq"]),
@@ -93,12 +94,9 @@ class PostgresThreadEventBus:
                 yield ev
 
             while True:
-                try:
-                    async for notify in listen_conn.notifies(timeout=5.0):
-                        if notify.payload == thread_id:
-                            break
-                except asyncio.CancelledError:
-                    raise
+                async for notify in listen_conn.notifies(timeout=5.0):
+                    if notify.payload == thread_id:
+                        break
 
                 events = await self._fetch_after(thread_id, last_seq)
                 for ev in events:
@@ -106,13 +104,15 @@ class PostgresThreadEventBus:
                     yield ev
 
     async def latest_seq(self, thread_id: str) -> int:
-        async with self._pool.connection() as conn:
-            async with conn.cursor(row_factory=dict_row) as cur:
-                await cur.execute(
-                    "SELECT COALESCE(MAX(seq), 0) AS max_seq FROM run_events WHERE thread_id = %s",
-                    (thread_id,),
-                )
-                row = await cur.fetchone()
+        async with (
+            self._pool.connection() as conn,
+            conn.cursor(row_factory=dict_row) as cur,
+        ):
+            await cur.execute(
+                "SELECT COALESCE(MAX(seq), 0) AS max_seq FROM run_events WHERE thread_id = %s",
+                (thread_id,),
+            )
+            row = await cur.fetchone()
         return int(row["max_seq"]) if row is not None else 0
 
     async def prune(

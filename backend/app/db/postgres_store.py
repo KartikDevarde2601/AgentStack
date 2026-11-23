@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+import psycopg
 from chatkit.store import NotFoundError, Store
 from chatkit.types import Attachment, Page, ThreadItem, ThreadMetadata
 from psycopg.rows import dict_row
@@ -41,24 +42,25 @@ class PostgresChatKitStore(Store[RequestContext]):
 
     async def ping(self) -> bool:
         try:
-            async with self._pool.connection() as conn:
-                async with conn.cursor() as cur:
-                    await cur.execute("SELECT 1")
-                    await cur.fetchone()
+            async with self._pool.connection() as conn, conn.cursor() as cur:
+                await cur.execute("SELECT 1")
+                await cur.fetchone()
             return True
-        except Exception:
+        except (psycopg.Error, OSError):
             return False
 
     async def load_thread(
         self, thread_id: str, context: RequestContext
     ) -> ThreadMetadata:
-        async with self._pool.connection() as conn:
-            async with conn.cursor(row_factory=dict_row) as cur:
-                await cur.execute(
-                    "SELECT payload FROM chatkit_threads WHERE id = %s",
-                    (thread_id,),
-                )
-                row = await cur.fetchone()
+        async with (
+            self._pool.connection() as conn,
+            conn.cursor(row_factory=dict_row) as cur,
+        ):
+            await cur.execute(
+                "SELECT payload FROM chatkit_threads WHERE id = %s",
+                (thread_id,),
+            )
+            row = await cur.fetchone()
         if row is None:
             raise NotFoundError(f"Thread {thread_id} not found")
         return ThreadMetadata.model_validate(row["payload"])
@@ -95,35 +97,27 @@ class PostgresChatKitStore(Store[RequestContext]):
         op = ">" if direction == "ASC" else "<"
         fetch_limit = max(1, limit) + 1
 
-        async with self._pool.connection() as conn:
-            async with conn.cursor(row_factory=dict_row) as cur:
-                if after:
+        async with (
+            self._pool.connection() as conn,
+            conn.cursor(row_factory=dict_row) as cur,
+        ):
+            if after:
+                await cur.execute(
+                    "SELECT created_at, id FROM chatkit_threads WHERE id = %s",
+                    (after,),
+                )
+                cursor_row = await cur.fetchone()
+                if cursor_row is not None:
                     await cur.execute(
-                        "SELECT created_at, id FROM chatkit_threads WHERE id = %s",
-                        (after,),
+                        f"""
+                        SELECT id, payload
+                        FROM chatkit_threads
+                        WHERE (created_at, id) {op} (%s, %s)
+                        ORDER BY created_at {direction}, id {direction}
+                        LIMIT %s
+                        """,
+                        (cursor_row["created_at"], cursor_row["id"], fetch_limit),
                     )
-                    cursor_row = await cur.fetchone()
-                    if cursor_row is not None:
-                        await cur.execute(
-                            f"""
-                            SELECT id, payload
-                            FROM chatkit_threads
-                            WHERE (created_at, id) {op} (%s, %s)
-                            ORDER BY created_at {direction}, id {direction}
-                            LIMIT %s
-                            """,
-                            (cursor_row["created_at"], cursor_row["id"], fetch_limit),
-                        )
-                    else:
-                        await cur.execute(
-                            f"""
-                            SELECT id, payload
-                            FROM chatkit_threads
-                            ORDER BY created_at {direction}, id {direction}
-                            LIMIT %s
-                            """,
-                            (fetch_limit,),
-                        )
                 else:
                     await cur.execute(
                         f"""
@@ -134,7 +128,17 @@ class PostgresChatKitStore(Store[RequestContext]):
                         """,
                         (fetch_limit,),
                     )
-                rows = await cur.fetchall()
+            else:
+                await cur.execute(
+                    f"""
+                    SELECT id, payload
+                    FROM chatkit_threads
+                    ORDER BY created_at {direction}, id {direction}
+                    LIMIT %s
+                    """,
+                    (fetch_limit,),
+                )
+            rows = await cur.fetchall()
 
         has_more = len(rows) > limit
         page_rows = rows[:limit]
@@ -163,40 +167,31 @@ class PostgresChatKitStore(Store[RequestContext]):
         op = ">" if direction == "ASC" else "<"
         fetch_limit = max(1, limit) + 1
 
-        async with self._pool.connection() as conn:
-            async with conn.cursor(row_factory=dict_row) as cur:
-                if after:
+        async with (
+            self._pool.connection() as conn,
+            conn.cursor(row_factory=dict_row) as cur,
+        ):
+            if after:
+                await cur.execute(
+                    "SELECT seq FROM chatkit_items WHERE thread_id = %s AND id = %s",
+                    (thread_id, after),
+                )
+                cursor_row = await cur.fetchone()
+                if cursor_row is not None:
                     await cur.execute(
-                        "SELECT seq FROM chatkit_items WHERE thread_id = %s AND id = %s",
-                        (thread_id, after),
+                        f"""
+                        SELECT id, payload
+                        FROM chatkit_items
+                        WHERE thread_id = %s AND seq {op} %s
+                        ORDER BY seq {direction}
+                        LIMIT %s
+                        """,
+                        (
+                            thread_id,
+                            cursor_row["seq"],
+                            fetch_limit,
+                        ),
                     )
-                    cursor_row = await cur.fetchone()
-                    if cursor_row is not None:
-                        await cur.execute(
-                            f"""
-                            SELECT id, payload
-                            FROM chatkit_items
-                            WHERE thread_id = %s AND seq {op} %s
-                            ORDER BY seq {direction}
-                            LIMIT %s
-                            """,
-                            (
-                                thread_id,
-                                cursor_row["seq"],
-                                fetch_limit,
-                            ),
-                        )
-                    else:
-                        await cur.execute(
-                            f"""
-                            SELECT id, payload
-                            FROM chatkit_items
-                            WHERE thread_id = %s
-                            ORDER BY seq {direction}
-                            LIMIT %s
-                            """,
-                            (thread_id, fetch_limit),
-                        )
                 else:
                     await cur.execute(
                         f"""
@@ -208,7 +203,18 @@ class PostgresChatKitStore(Store[RequestContext]):
                         """,
                         (thread_id, fetch_limit),
                     )
-                rows = await cur.fetchall()
+            else:
+                await cur.execute(
+                    f"""
+                    SELECT id, payload
+                    FROM chatkit_items
+                    WHERE thread_id = %s
+                    ORDER BY seq {direction}
+                    LIMIT %s
+                    """,
+                    (thread_id, fetch_limit),
+                )
+            rows = await cur.fetchall()
 
         has_more = len(rows) > limit
         page_rows = rows[:limit]
@@ -246,13 +252,15 @@ class PostgresChatKitStore(Store[RequestContext]):
     async def load_item(
         self, thread_id: str, item_id: str, context: RequestContext
     ) -> ThreadItem:
-        async with self._pool.connection() as conn:
-            async with conn.cursor(row_factory=dict_row) as cur:
-                await cur.execute(
-                    "SELECT payload FROM chatkit_items WHERE thread_id = %s AND id = %s",
-                    (thread_id, item_id),
-                )
-                row = await cur.fetchone()
+        async with (
+            self._pool.connection() as conn,
+            conn.cursor(row_factory=dict_row) as cur,
+        ):
+            await cur.execute(
+                "SELECT payload FROM chatkit_items WHERE thread_id = %s AND id = %s",
+                (thread_id, item_id),
+            )
+            row = await cur.fetchone()
         if row is None:
             raise NotFoundError(f"Item {item_id} not found in thread {thread_id}")
         return _THREAD_ITEM_ADAPTER.validate_python(row["payload"])
@@ -289,13 +297,15 @@ class PostgresChatKitStore(Store[RequestContext]):
     async def load_attachment(
         self, attachment_id: str, context: RequestContext
     ) -> Attachment:
-        async with self._pool.connection() as conn:
-            async with conn.cursor(row_factory=dict_row) as cur:
-                await cur.execute(
-                    "SELECT payload FROM chatkit_attachments WHERE id = %s",
-                    (attachment_id,),
-                )
-                row = await cur.fetchone()
+        async with (
+            self._pool.connection() as conn,
+            conn.cursor(row_factory=dict_row) as cur,
+        ):
+            await cur.execute(
+                "SELECT payload FROM chatkit_attachments WHERE id = %s",
+                (attachment_id,),
+            )
+            row = await cur.fetchone()
         if row is None:
             raise NotFoundError(f"Attachment {attachment_id} not found")
         return _ATTACHMENT_ADAPTER.validate_python(row["payload"])
@@ -332,32 +342,34 @@ class PostgresChatKitStore(Store[RequestContext]):
         )
 
     async def list_thread_summaries(self, limit: int = 50) -> list[ThreadSummary]:
-        async with self._pool.connection() as conn:
-            async with conn.cursor(row_factory=dict_row) as cur:
-                await cur.execute(
-                    """
-                    SELECT
-                        t.id,
-                        t.title,
-                        t.created_at,
-                        t.updated_at,
-                        COUNT(DISTINCT i.id) AS item_count,
-                        (
-                            SELECT r.phase
-                            FROM research_runs r
-                            WHERE r.thread_id = t.id
-                            ORDER BY r.updated_at DESC
-                            LIMIT 1
-                        ) AS latest_phase
-                    FROM chatkit_threads t
-                    LEFT JOIN chatkit_items i ON i.thread_id = t.id
-                    GROUP BY t.id
-                    ORDER BY t.updated_at DESC, t.created_at DESC
-                    LIMIT %s
-                    """,
-                    (limit,),
-                )
-                rows = await cur.fetchall()
+        async with (
+            self._pool.connection() as conn,
+            conn.cursor(row_factory=dict_row) as cur,
+        ):
+            await cur.execute(
+                """
+                SELECT
+                    t.id,
+                    t.title,
+                    t.created_at,
+                    t.updated_at,
+                    COUNT(DISTINCT i.id) AS item_count,
+                    (
+                        SELECT r.phase
+                        FROM research_runs r
+                        WHERE r.thread_id = t.id
+                        ORDER BY r.updated_at DESC
+                        LIMIT 1
+                    ) AS latest_phase
+                FROM chatkit_threads t
+                LEFT JOIN chatkit_items i ON i.thread_id = t.id
+                GROUP BY t.id
+                ORDER BY t.updated_at DESC, t.created_at DESC
+                LIMIT %s
+                """,
+                (limit,),
+            )
+            rows = await cur.fetchall()
 
         return [
             ThreadSummary(
@@ -428,28 +440,32 @@ class PostgresChatKitStore(Store[RequestContext]):
         return _row_to_run_record(row)
 
     async def list_research_runs(self, thread_id: str) -> list[ResearchRunRecord]:
-        async with self._pool.connection() as conn:
-            async with conn.cursor(row_factory=dict_row) as cur:
-                await cur.execute(
-                    """
-                    SELECT *
-                    FROM research_runs
-                    WHERE thread_id = %s
-                    ORDER BY created_at DESC
-                    """,
-                    (thread_id,),
-                )
-                rows = await cur.fetchall()
+        async with (
+            self._pool.connection() as conn,
+            conn.cursor(row_factory=dict_row) as cur,
+        ):
+            await cur.execute(
+                """
+                SELECT *
+                FROM research_runs
+                WHERE thread_id = %s
+                ORDER BY created_at DESC
+                """,
+                (thread_id,),
+            )
+            rows = await cur.fetchall()
         return [_row_to_run_record(row) for row in rows]
 
     async def get_openai_conversation_id(self, thread_id: str) -> str | None:
-        async with self._pool.connection() as conn:
-            async with conn.cursor(row_factory=dict_row) as cur:
-                await cur.execute(
-                    "SELECT openai_conversation_id FROM chatkit_threads WHERE id = %s",
-                    (thread_id,),
-                )
-                row = await cur.fetchone()
+        async with (
+            self._pool.connection() as conn,
+            conn.cursor(row_factory=dict_row) as cur,
+        ):
+            await cur.execute(
+                "SELECT openai_conversation_id FROM chatkit_threads WHERE id = %s",
+                (thread_id,),
+            )
+            row = await cur.fetchone()
         if row is None:
             return None
         return row["openai_conversation_id"]
@@ -470,23 +486,25 @@ class PostgresChatKitStore(Store[RequestContext]):
             await conn.commit()
 
     async def list_active_research_runs(self) -> list[ResearchRunRecord]:
-        async with self._pool.connection() as conn:
-            async with conn.cursor(row_factory=dict_row) as cur:
-                await cur.execute(
-                    """
-                    SELECT *
-                    FROM research_runs
-                    WHERE phase NOT IN (%s, %s, %s, %s)
-                    ORDER BY created_at DESC
-                    """,
-                    (
-                        ResearchPhase.IDLE.value,
-                        ResearchPhase.COMPLETED.value,
-                        ResearchPhase.INTERRUPTED.value,
-                        ResearchPhase.FAILED.value,
-                    ),
-                )
-                rows = await cur.fetchall()
+        async with (
+            self._pool.connection() as conn,
+            conn.cursor(row_factory=dict_row) as cur,
+        ):
+            await cur.execute(
+                """
+                SELECT *
+                FROM research_runs
+                WHERE phase NOT IN (%s, %s, %s, %s)
+                ORDER BY created_at DESC
+                """,
+                (
+                    ResearchPhase.IDLE.value,
+                    ResearchPhase.COMPLETED.value,
+                    ResearchPhase.INTERRUPTED.value,
+                    ResearchPhase.FAILED.value,
+                ),
+            )
+            rows = await cur.fetchall()
         return [_row_to_run_record(row) for row in rows]
 
 

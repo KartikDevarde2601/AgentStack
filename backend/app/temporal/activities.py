@@ -16,23 +16,23 @@ from pydantic import BaseModel, Field
 from temporalio import activity
 
 from app.domain import (
+    ClarificationQuestion,
     RequestContext,
     ResearchFinding,
     ResearchPhase,
-    ResearchPlan,
     ResearchProgress,
     ResearchRunRecord,
-    TurnResponse,
 )
 from app.events import ThreadEvent, ThreadEventBus, ThreadEventKind
-from app.research.openai_client import ResearchLLMClient
 from app.widgets import (
     actions_widget_item_id,
     approval_widget_item_id,
+    build_clarifications_widget,
     build_findings_explorer_widget,
     build_followup_actions_widget,
     build_plan_approval_widget,
     build_progress_tracker_widget,
+    clarifications_widget_item_id,
     findings_widget_item_id,
     progress_widget_item_id,
 )
@@ -40,6 +40,7 @@ from app.widgets import (
 _PHASE_ICONS: dict[ResearchPhase, str] = {
     ResearchPhase.IDLE: "clock",
     ResearchPhase.QUEUED: "clock",
+    ResearchPhase.AWAITING_CLARIFICATIONS: "compass",
     ResearchPhase.PLANNING: "compass",
     ResearchPhase.AWAITING_APPROVAL: "compass",
     ResearchPhase.RESEARCHING: "search",
@@ -48,6 +49,14 @@ _PHASE_ICONS: dict[ResearchPhase, str] = {
     ResearchPhase.INTERRUPTED: "clock",
     ResearchPhase.FAILED: "bug",
 }
+
+
+class ConversationClient(Protocol):
+    async def create_conversation(self) -> str: ...
+
+    async def append_conversation_messages(
+        self, conversation_id: str, messages: list[dict[str, str]]
+    ) -> None: ...
 
 
 class ThreadPersistenceStore(Protocol):
@@ -87,37 +96,27 @@ class PersistUserMessageInput(BaseModel):
     text: str
 
 
-class PlanResearchInput(BaseModel):
-    query: str
-    conversation_id: str | None = None
-
-
-class GatherFindingInput(BaseModel):
-    query: str
-    sub_question: str
-    depth: str = "standard"
-    conversation_id: str | None = None
-
-
-class SynthesizeReportInput(BaseModel):
-    thread_id: str
-    turn_id: str
-    query: str
-    findings: list[ResearchFinding]
-    conversation_id: str | None = None
-
-
 class PublishProgressInput(BaseModel):
     thread_id: str
     turn_id: str
     query: str
     phase: ResearchPhase
     message: str
+    enhanced_prompt: str = ""
     sub_questions: list[str] = Field(default_factory=list)
     completed_sub_questions: int = 0
     total_sub_questions: int = 0
     update_progress_widget: bool = False
     is_new_progress_widget: bool = False
+
+
+class PersistClarificationsWidgetInput(BaseModel):
+    thread_id: str
+    turn_id: str
+    intro: str = ""
+    questions: list[ClarificationQuestion] = Field(default_factory=list)
+    state: Literal["pending", "submitted", "skipped"] = "pending"
+    answers: dict[str, str] = Field(default_factory=dict)
 
 
 class PersistApprovalWidgetInput(BaseModel):
@@ -127,6 +126,17 @@ class PersistApprovalWidgetInput(BaseModel):
     state: Literal["pending", "approved", "cancelled"] = "pending"
     selected_depth: Literal["concise", "standard", "deep"] = "standard"
     extra_focus: str = ""
+
+
+class PublishReportInput(BaseModel):
+    thread_id: str
+    turn_id: str
+    query: str
+    enhanced_prompt: str = ""
+    findings: list[ResearchFinding] = Field(default_factory=list)
+    report: str
+    follow_up_questions: list[str] = Field(default_factory=list)
+    conversation_id: str | None = None
 
 
 class PersistFinalItemInput(BaseModel):
@@ -156,7 +166,7 @@ def _activity_meta() -> tuple[str | None, int]:
     try:
         info = activity.info()
         return info.activity_id, info.attempt
-    except Exception:
+    except RuntimeError:
         return None, 1
 
 
@@ -166,13 +176,49 @@ class ThreadActivities:
     def __init__(
         self,
         *,
-        client: ResearchLLMClient,
+        client: ConversationClient,
         store: ThreadPersistenceStore,
         event_bus: ThreadEventBus,
     ) -> None:
         self._client = client
         self._store = store
         self._event_bus = event_bus
+
+    async def _publish(
+        self,
+        *,
+        thread_id: str,
+        turn_id: str,
+        kind: ThreadEventKind,
+        payload: dict[str, Any],
+    ) -> int:
+        act_id, attempt = _activity_meta()
+        return await self._event_bus.publish(
+            ThreadEvent(
+                thread_id=thread_id,
+                turn_id=turn_id,
+                kind=kind,
+                payload=payload,
+                activity_id=act_id,
+                attempt=attempt,
+            )
+        )
+
+    async def _save_and_publish_item(
+        self,
+        *,
+        thread_id: str,
+        turn_id: str,
+        item: ThreadItem,
+        kind: ThreadEventKind = ThreadEventKind.ITEM_DONE,
+    ) -> None:
+        await self._store.save_item(thread_id, item, RequestContext())
+        await self._publish(
+            thread_id=thread_id,
+            turn_id=turn_id,
+            kind=kind,
+            payload={"item": item.model_dump(mode="json")},
+        )
 
     @activity.defn(name="ensure_openai_conversation_activity")
     async def ensure_openai_conversation_activity(self, thread_id: str) -> str:
@@ -214,17 +260,8 @@ class ThreadActivities:
             attachments=[],
             inference_options=InferenceOptions(),
         )
-        await self._store.save_item(params.thread_id, item, RequestContext())
-        act_id, attempt = _activity_meta()
-        await self._event_bus.publish(
-            ThreadEvent(
-                thread_id=params.thread_id,
-                turn_id=params.turn_id,
-                kind=ThreadEventKind.ITEM_DONE,
-                payload={"item": item.model_dump(mode="json")},
-                activity_id=act_id,
-                attempt=attempt,
-            )
+        await self._save_and_publish_item(
+            thread_id=params.thread_id, turn_id=params.turn_id, item=item
         )
 
     @activity.defn(name="publish_progress_activity")
@@ -237,20 +274,15 @@ class ThreadActivities:
             message=params.message,
             sub_questions=params.sub_questions,
         )
-        act_id, attempt = _activity_meta()
-        await self._event_bus.publish(
-            ThreadEvent(
-                thread_id=params.thread_id,
-                turn_id=params.turn_id,
-                kind=ThreadEventKind.PROGRESS,
-                payload={
-                    "icon": _PHASE_ICONS.get(params.phase, "compass"),
-                    "text": params.message,
-                    "phase": params.phase.value,
-                },
-                activity_id=act_id,
-                attempt=attempt,
-            )
+        await self._publish(
+            thread_id=params.thread_id,
+            turn_id=params.turn_id,
+            kind=ThreadEventKind.PROGRESS,
+            payload={
+                "icon": _PHASE_ICONS.get(params.phase, "compass"),
+                "text": params.message,
+                "phase": params.phase.value,
+            },
         )
         if params.update_progress_widget:
             progress = ResearchProgress(
@@ -258,6 +290,7 @@ class ThreadActivities:
                 query=params.query,
                 phase=params.phase,
                 message=params.message,
+                enhanced_prompt=params.enhanced_prompt,
                 sub_questions=params.sub_questions,
                 completed_sub_questions=params.completed_sub_questions,
                 total_sub_questions=params.total_sub_questions,
@@ -268,21 +301,52 @@ class ThreadActivities:
                 created_at=datetime.now(UTC),
                 widget=build_progress_tracker_widget(progress),
             )
-            await self._store.save_item(params.thread_id, widget_item, RequestContext())
-            await self._event_bus.publish(
-                ThreadEvent(
-                    thread_id=params.thread_id,
-                    turn_id=params.turn_id,
-                    kind=(
-                        ThreadEventKind.ITEM_DONE
-                        if params.is_new_progress_widget
-                        else ThreadEventKind.ITEM_REPLACED
-                    ),
-                    payload={"item": widget_item.model_dump(mode="json")},
-                    activity_id=act_id,
-                    attempt=attempt,
-                )
+            await self._save_and_publish_item(
+                thread_id=params.thread_id,
+                turn_id=params.turn_id,
+                item=widget_item,
+                kind=(
+                    ThreadEventKind.ITEM_DONE
+                    if params.is_new_progress_widget
+                    else ThreadEventKind.ITEM_REPLACED
+                ),
             )
+
+    @activity.defn(name="persist_clarifications_widget_activity")
+    async def persist_clarifications_widget_activity(
+        self, params: PersistClarificationsWidgetInput
+    ) -> str:
+        widget_id = clarifications_widget_item_id(params.turn_id)
+        clarify_item = WidgetItem(
+            id=widget_id,
+            thread_id=params.thread_id,
+            created_at=datetime.now(UTC),
+            widget=build_clarifications_widget(
+                workflow_id=params.turn_id,
+                intro=params.intro,
+                questions=params.questions,
+                state=params.state,
+                answers=params.answers,
+            ),
+        )
+        await self._save_and_publish_item(
+            thread_id=params.thread_id,
+            turn_id=params.turn_id,
+            item=clarify_item,
+            kind=(
+                ThreadEventKind.ITEM_DONE
+                if params.state == "pending"
+                else ThreadEventKind.ITEM_REPLACED
+            ),
+        )
+        if params.state == "pending":
+            await self._publish(
+                thread_id=params.thread_id,
+                turn_id=params.turn_id,
+                kind=ThreadEventKind.APPROVAL_PAUSE,
+                payload={"widget_item_id": widget_id},
+            )
+        return widget_id
 
     @activity.defn(name="persist_approval_widget_activity")
     async def persist_approval_widget_activity(
@@ -301,67 +365,31 @@ class ThreadActivities:
                 extra_focus=params.extra_focus,
             ),
         )
-        await self._store.save_item(params.thread_id, approval_item, RequestContext())
-        act_id, attempt = _activity_meta()
-        kind = (
-            ThreadEventKind.ITEM_DONE
-            if params.state == "pending"
-            else ThreadEventKind.ITEM_REPLACED
-        )
-        await self._event_bus.publish(
-            ThreadEvent(
-                thread_id=params.thread_id,
-                turn_id=params.turn_id,
-                kind=kind,
-                payload={"item": approval_item.model_dump(mode="json")},
-                activity_id=act_id,
-                attempt=attempt,
-            )
+        await self._save_and_publish_item(
+            thread_id=params.thread_id,
+            turn_id=params.turn_id,
+            item=approval_item,
+            kind=(
+                ThreadEventKind.ITEM_DONE
+                if params.state == "pending"
+                else ThreadEventKind.ITEM_REPLACED
+            ),
         )
         if params.state == "pending":
-            await self._event_bus.publish(
-                ThreadEvent(
-                    thread_id=params.thread_id,
-                    turn_id=params.turn_id,
-                    kind=ThreadEventKind.APPROVAL_PAUSE,
-                    payload={"widget_item_id": widget_id},
-                    activity_id=act_id,
-                    attempt=attempt,
-                )
+            await self._publish(
+                thread_id=params.thread_id,
+                turn_id=params.turn_id,
+                kind=ThreadEventKind.APPROVAL_PAUSE,
+                payload={"widget_item_id": widget_id},
             )
         return widget_id
 
-    @activity.defn(name="plan_research_activity")
-    async def plan_research_activity(self, params: PlanResearchInput) -> ResearchPlan:
-        return await self._client.generate_research_plan(
-            params.query, conversation_id=params.conversation_id
-        )
-
-    @activity.defn(name="resolve_turn_activity")
-    async def resolve_turn_activity(self, params: PlanResearchInput) -> TurnResponse:
-        return await self._client.resolve_turn(
-            params.query, conversation_id=params.conversation_id
-        )
-
-    @activity.defn(name="investigate_sub_question_activity")
-    async def investigate_sub_question_activity(
-        self, params: GatherFindingInput
-    ) -> ResearchFinding:
-        return await self._client.investigate_sub_question(
-            params.query,
-            params.sub_question,
-            depth=params.depth,
-            conversation_id=params.conversation_id,
-        )
-
-    @activity.defn(name="synthesize_report_activity")
-    async def synthesize_report_activity(self, params: SynthesizeReportInput) -> str:
-        act_id, attempt = _activity_meta()
+    @activity.defn(name="publish_report_activity")
+    async def publish_report_activity(self, params: PublishReportInput) -> str:
         item_id = turn_assistant_item_id(params.turn_id)
         created_at = datetime.now(UTC)
 
-        # Publish findings explorer widget before streaming the final report.
-        if params.findings:
+        if params.findings or params.enhanced_prompt:
             findings_item = WidgetItem(
                 id=findings_widget_item_id(params.turn_id),
                 thread_id=params.thread_id,
@@ -369,20 +397,11 @@ class ThreadActivities:
                 widget=build_findings_explorer_widget(
                     workflow_id=params.turn_id,
                     findings=params.findings,
+                    enhanced_prompt=params.enhanced_prompt,
                 ),
             )
-            await self._store.save_item(
-                params.thread_id, findings_item, RequestContext()
-            )
-            await self._event_bus.publish(
-                ThreadEvent(
-                    thread_id=params.thread_id,
-                    turn_id=params.turn_id,
-                    kind=ThreadEventKind.ITEM_DONE,
-                    payload={"item": findings_item.model_dump(mode="json")},
-                    activity_id=act_id,
-                    attempt=attempt,
-                )
+            await self._save_and_publish_item(
+                thread_id=params.thread_id, turn_id=params.turn_id, item=findings_item
             )
 
         initial_item = AssistantMessageItem(
@@ -391,35 +410,22 @@ class ThreadActivities:
             created_at=created_at,
             content=[],
         )
-        await self._event_bus.publish(
-            ThreadEvent(
+        await self._publish(
+            thread_id=params.thread_id,
+            turn_id=params.turn_id,
+            kind=ThreadEventKind.ITEM_ADDED,
+            payload={"item": initial_item.model_dump(mode="json")},
+        )
+
+        report = params.report.strip()
+        chunk_size = 240
+        for idx in range(0, len(report), chunk_size):
+            await self._publish(
                 thread_id=params.thread_id,
                 turn_id=params.turn_id,
-                kind=ThreadEventKind.ITEM_ADDED,
-                payload={"item": initial_item.model_dump(mode="json")},
-                activity_id=act_id,
-                attempt=attempt,
+                kind=ThreadEventKind.TEXT_DELTA,
+                payload={"item_id": item_id, "delta": report[idx : idx + chunk_size]},
             )
-        )
-
-        async def _emit_delta(delta: str) -> None:
-            await self._event_bus.publish(
-                ThreadEvent(
-                    thread_id=params.thread_id,
-                    turn_id=params.turn_id,
-                    kind=ThreadEventKind.TEXT_DELTA,
-                    payload={"item_id": item_id, "delta": delta},
-                    activity_id=act_id,
-                    attempt=attempt,
-                )
-            )
-
-        report = await self._client.synthesize_report_stream(
-            params.query,
-            params.findings,
-            conversation_id=params.conversation_id,
-            on_delta=_emit_delta,
-        )
 
         final_item = AssistantMessageItem(
             id=item_id,
@@ -427,7 +433,6 @@ class ThreadActivities:
             created_at=created_at,
             content=[AssistantMessageContent(text=report)],
         )
-        await self._store.save_item(params.thread_id, final_item, RequestContext())
         await self._store.upsert_research_run(
             thread_id=params.thread_id,
             workflow_id=params.turn_id,
@@ -437,15 +442,12 @@ class ThreadActivities:
             sub_questions=[f.sub_question for f in params.findings],
             report=report,
         )
-        await self._event_bus.publish(
-            ThreadEvent(
-                thread_id=params.thread_id,
-                turn_id=params.turn_id,
-                kind=ThreadEventKind.ITEM_DONE,
-                payload={"item": final_item.model_dump(mode="json")},
-                activity_id=act_id,
-                attempt=attempt,
+        if params.conversation_id and report:
+            await self._client.append_conversation_messages(
+                params.conversation_id, [{"role": "assistant", "content": report}]
             )
+        await self._save_and_publish_item(
+            thread_id=params.thread_id, turn_id=params.turn_id, item=final_item
         )
 
         actions_item = WidgetItem(
@@ -455,40 +457,13 @@ class ThreadActivities:
             widget=build_followup_actions_widget(
                 workflow_id=params.turn_id,
                 query=params.query,
+                follow_up_questions=params.follow_up_questions,
             ),
         )
-        await self._store.save_item(params.thread_id, actions_item, RequestContext())
-        await self._event_bus.publish(
-            ThreadEvent(
-                thread_id=params.thread_id,
-                turn_id=params.turn_id,
-                kind=ThreadEventKind.ITEM_DONE,
-                payload={"item": actions_item.model_dump(mode="json")},
-                activity_id=act_id,
-                attempt=attempt,
-            )
+        await self._save_and_publish_item(
+            thread_id=params.thread_id, turn_id=params.turn_id, item=actions_item
         )
         return report
-
-    async def _publish(
-        self,
-        *,
-        thread_id: str,
-        turn_id: str,
-        kind: ThreadEventKind,
-        payload: dict[str, Any],
-    ) -> int:
-        act_id, attempt = _activity_meta()
-        return await self._event_bus.publish(
-            ThreadEvent(
-                thread_id=thread_id,
-                turn_id=turn_id,
-                kind=kind,
-                payload=payload,
-                activity_id=act_id,
-                attempt=attempt,
-            )
-        )
 
     @activity.defn(name="persist_final_item_activity")
     async def persist_final_item_activity(
@@ -500,7 +475,6 @@ class ThreadActivities:
             created_at=datetime.now(UTC),
             content=[AssistantMessageContent(text=params.text)],
         )
-        await self._store.save_item(params.thread_id, item, RequestContext())
         if params.record_research_run:
             await self._store.upsert_research_run(
                 thread_id=params.thread_id,
@@ -512,11 +486,8 @@ class ThreadActivities:
                 report=params.text if params.phase != ResearchPhase.FAILED else None,
                 error=params.error,
             )
-        await self._publish(
-            thread_id=params.thread_id,
-            turn_id=params.turn_id,
-            kind=ThreadEventKind.ITEM_DONE,
-            payload={"item": item.model_dump(mode="json")},
+        await self._save_and_publish_item(
+            thread_id=params.thread_id, turn_id=params.turn_id, item=item
         )
         await self._publish(
             thread_id=params.thread_id,

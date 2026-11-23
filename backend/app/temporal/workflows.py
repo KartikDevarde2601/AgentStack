@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 from datetime import timedelta
 
 from pydantic import BaseModel, Field
@@ -10,25 +9,25 @@ from temporalio.common import RetryPolicy
 with workflow.unsafe.imports_passed_through():
     from app.domain import (
         ApprovalDecision,
-        ConversationReply,
+        ClarificationSubmission,
         IncomingMessage,
         PendingApproval,
+        PendingClarification,
         ResearchFinding,
         ResearchPhase,
-        ResearchPlan,
         ThreadWorkflowState,
-        TurnResponse,
     )
+    from app.research.agents.models import EnhancedResearchBrief, WebSearchItem
+    from app.research.agents.research_manager import DeepResearchManager
     from app.temporal.activities import (
-        GatherFindingInput,
         PersistApprovalWidgetInput,
+        PersistClarificationsWidgetInput,
         PersistFinalItemInput,
         PersistUserMessageInput,
-        PlanResearchInput,
         PublishProgressInput,
+        PublishReportInput,
         PublishTurnEndInput,
         RecordFailedTurnsInput,
-        SynthesizeReportInput,
     )
 
 _ACTIVITY_RETRY = RetryPolicy(
@@ -42,6 +41,7 @@ DEFAULT_MAX_TURNS_BEFORE_CONTINUE = 25
 
 class AgentThreadInput(BaseModel):
     thread_id: str
+    model: str = "gpt-4.1-mini"
     openai_conversation_id: str | None = None
     unrecorded_turns: list[tuple[str, str]] = Field(default_factory=list)
     require_approval: bool = True
@@ -53,32 +53,95 @@ class AgentThreadInput(BaseModel):
 class AgentThreadWorkflow:
     """Durable per-Thread Entity Workflow (id = thread-{thread_id}).
 
-    Owns turn execution, Approval Gate suspension, 30-min idle exit,
+    Orchestrates the multi-agent DeepResearchManager (Triage -> Clarifying ->
+    Instruction -> Planner -> Parallel WebSearch -> Writer) via OpenAIAgentsPlugin,
+    with two HITL gates (dynamic clarifications + plan approval), 30-min idle exit,
     and continue_as_new history bounds.
     """
 
     def __init__(self) -> None:
         self._thread_id: str = ""
+        self._model: str = "gpt-4.1-mini"
         self._openai_conversation_id: str | None = None
         self._phase: ResearchPhase = ResearchPhase.IDLE
         self._active_turn_id: str | None = None
         self._message: str = ""
         self._pending_message: IncomingMessage | None = None
+        self._pending_clarification: PendingClarification | None = None
+        self._clarification_submission: ClarificationSubmission | None = None
         self._pending_approval: PendingApproval | None = None
         self._approval_decision: ApprovalDecision | None = None
         self._turns_since_continue: int = 0
         self._active_query: str = ""
         self._active_sub_questions: list[str] = []
         self._unrecorded_turns: list[tuple[str, str]] = []
+        self._workflow_ended: bool = False
 
     @workflow.signal
     def submit_message(self, msg: IncomingMessage) -> None:
-        if self._active_turn_id is None and self._pending_message is None:
+        if (
+            not self._workflow_ended
+            and self._active_turn_id is None
+            and self._pending_message is None
+        ):
             self._pending_message = msg
 
     @workflow.signal
-    def submit_approval(self, decision: ApprovalDecision) -> None:
+    def end_workflow(self) -> None:
+        """Fire-and-forget lifecycle signal to gracefully exit the workflow."""
+        self._workflow_ended = True
+
+    @workflow.update
+    async def submit_clarifications(
+        self, submission: ClarificationSubmission
+    ) -> ThreadWorkflowState:
+        """Validated HITL update to submit or skip clarifying questions."""
+        self._clarification_submission = submission
+        return self.get_state()
+
+    @submit_clarifications.validator
+    def validate_submit_clarifications(
+        self, submission: ClarificationSubmission
+    ) -> None:
+        if self._workflow_ended:
+            raise ValueError("This research thread has ended.")
+        if (
+            self._phase != ResearchPhase.AWAITING_CLARIFICATIONS
+            or self._pending_clarification is None
+        ):
+            raise ValueError("This thread is not currently awaiting clarifications.")
+        if self._clarification_submission is not None:
+            raise ValueError("Clarifications have already been submitted for this turn.")
+        if submission.turn_id and submission.turn_id != self._active_turn_id:
+            raise ValueError(
+                "This clarification card belongs to an earlier turn and is no longer active."
+            )
+        if not submission.skipped and not submission.answers:
+            raise ValueError("Please provide at least one clarification answer or choose Skip.")
+
+    @workflow.update
+    async def submit_approval(
+        self, decision: ApprovalDecision
+    ) -> ThreadWorkflowState:
+        """Validated HITL update to approve or cancel the planned web searches."""
         self._approval_decision = decision
+        return self.get_state()
+
+    @submit_approval.validator
+    def validate_submit_approval(self, decision: ApprovalDecision) -> None:
+        if self._workflow_ended:
+            raise ValueError("This research thread has ended.")
+        if (
+            self._phase != ResearchPhase.AWAITING_APPROVAL
+            or self._pending_approval is None
+        ):
+            raise ValueError("This thread is not currently awaiting plan approval.")
+        if self._approval_decision is not None:
+            raise ValueError("A decision has already been recorded for this research plan.")
+        if decision.turn_id and decision.turn_id != self._active_turn_id:
+            raise ValueError(
+                "This approval card belongs to an earlier turn and is no longer active."
+            )
 
     @workflow.query
     def get_state(self) -> ThreadWorkflowState:
@@ -88,6 +151,7 @@ class AgentThreadWorkflow:
             phase=self._phase,
             active_turn_id=self._active_turn_id,
             message=self._message,
+            pending_clarification=self._pending_clarification,
             pending_approval=self._pending_approval,
             turns_since_continue=self._turns_since_continue,
         )
@@ -95,27 +159,30 @@ class AgentThreadWorkflow:
     @workflow.run
     async def run(self, params: AgentThreadInput) -> None:
         self._thread_id = params.thread_id
+        self._model = params.model
         self._openai_conversation_id = params.openai_conversation_id
         self._unrecorded_turns.extend(params.unrecorded_turns)
 
         while True:
+            if self._workflow_ended:
+                await self._prune_events()
+                return
+
             if self._pending_message is None:
                 self._phase = ResearchPhase.IDLE
                 self._active_turn_id = None
                 self._message = ""
                 try:
                     await workflow.wait_condition(
-                        lambda: self._pending_message is not None,
+                        lambda: self._workflow_ended or self._pending_message is not None,
                         timeout=timedelta(seconds=params.idle_timeout_seconds),
                     )
                 except TimeoutError:
-                    await workflow.execute_activity(
-                        "prune_thread_events_activity",
-                        self._thread_id,
-                        result_type=int,
-                        start_to_close_timeout=timedelta(seconds=30),
-                        retry_policy=_ACTIVITY_RETRY,
-                    )
+                    await self._prune_events()
+                    return
+
+                if self._workflow_ended:
+                    await self._prune_events()
                     return
 
             if self._openai_conversation_id is None:
@@ -131,6 +198,8 @@ class AgentThreadWorkflow:
             assert next_msg is not None
             self._pending_message = None
             turn_id = f"turn_{workflow.uuid4().hex[:10]}"
+            self._clarification_submission = None
+            self._pending_clarification = None
             self._approval_decision = None
             self._pending_approval = None
             self._active_turn_id = turn_id
@@ -144,6 +213,7 @@ class AgentThreadWorkflow:
                     require_approval=params.require_approval,
                 )
             finally:
+                self._pending_clarification = None
                 self._pending_approval = None
 
             self._turns_since_continue += 1
@@ -154,6 +224,7 @@ class AgentThreadWorkflow:
                 workflow.continue_as_new(
                     AgentThreadInput(
                         thread_id=self._thread_id,
+                        model=self._model,
                         openai_conversation_id=self._openai_conversation_id,
                         unrecorded_turns=list(self._unrecorded_turns),
                         require_approval=params.require_approval,
@@ -161,6 +232,15 @@ class AgentThreadWorkflow:
                         max_turns_before_continue=params.max_turns_before_continue,
                     )
                 )
+
+    async def _prune_events(self) -> None:
+        await workflow.execute_activity(
+            "prune_thread_events_activity",
+            self._thread_id,
+            result_type=int,
+            start_to_close_timeout=timedelta(seconds=30),
+            retry_policy=_ACTIVITY_RETRY,
+        )
 
     async def _flush_unrecorded_turns(self, *, best_effort: bool = False) -> None:
         if not self._unrecorded_turns or not self._openai_conversation_id:
@@ -187,13 +267,9 @@ class AgentThreadWorkflow:
         require_approval: bool,
     ) -> None:
         query = msg.text
-        # Temporal caches patch decisions per workflow run. Scope the marker to
-        # this turn so replaying an older turn does not pin subsequent turns.
-        resolve_turn = workflow.patched(
-            f"resolve-conversation-turn-{self._turns_since_continue}"
-        )
+        manager = DeepResearchManager(model=self._model)
         response_received = False
-        research_started = not resolve_turn
+        research_started = False
         try:
             if not msg.already_persisted:
                 await workflow.execute_activity(
@@ -208,50 +284,144 @@ class AgentThreadWorkflow:
                     retry_policy=_ACTIVITY_RETRY,
                 )
 
-            plan_input = PlanResearchInput(
-                query=query, conversation_id=self._openai_conversation_id
+            self._phase = ResearchPhase.PLANNING
+            self._message = "Analyzing your request..."
+            await self._flush_unrecorded_turns()
+
+            outcome = await manager.triage(
+                query, conversation_id=self._openai_conversation_id
             )
-            if resolve_turn:
-                self._phase = ResearchPhase.PLANNING
-                self._message = "Reading your request..."
-                await self._flush_unrecorded_turns()
-                response = await workflow.execute_activity(
-                    "resolve_turn_activity",
-                    plan_input,
-                    result_type=TurnResponse,
-                    start_to_close_timeout=timedelta(seconds=60),
+            response_received = True
+
+            # Branch 1: Direct conversational answer
+            if outcome.kind == "answer":
+                await workflow.execute_activity(
+                    "persist_final_item_activity",
+                    PersistFinalItemInput(
+                        thread_id=self._thread_id,
+                        turn_id=turn_id,
+                        query=query,
+                        phase=ResearchPhase.COMPLETED,
+                        message="",
+                        text=outcome.direct_answer or "",
+                        record_research_run=False,
+                    ),
+                    start_to_close_timeout=timedelta(seconds=30),
                     retry_policy=_ACTIVITY_RETRY,
                 )
-                response_received = True
-                if isinstance(response, ConversationReply):
-                    await workflow.execute_activity(
-                        "persist_final_item_activity",
-                        PersistFinalItemInput(
-                            thread_id=self._thread_id,
-                            turn_id=turn_id,
-                            query=query,
-                            phase=ResearchPhase.COMPLETED,
-                            message="",
-                            text=response.text,
-                            record_research_run=False,
-                        ),
-                        start_to_close_timeout=timedelta(seconds=30),
-                        retry_policy=_ACTIVITY_RETRY,
-                    )
-                    self._phase = ResearchPhase.COMPLETED
-                    self._message = ""
-                    return
-                plan = response
-                research_started = True
+                self._phase = ResearchPhase.COMPLETED
+                self._message = ""
+                return
 
+            research_started = True
+            brief: EnhancedResearchBrief
+
+            # Branch 2: Dynamic HITL Clarifications -> Prompt Enhancement
+            if outcome.kind == "clarify" and outcome.clarifications is not None:
+                clarifications = outcome.clarifications
+                clarification_id = f"clr_{workflow.uuid4().hex[:12]}"
+                widget_id = f"wgt_clarify_{turn_id}"
+                self._pending_clarification = PendingClarification(
+                    turn_id=turn_id,
+                    clarification_id=clarification_id,
+                    intro=clarifications.intro,
+                    questions=list(clarifications.questions),
+                    widget_item_id=widget_id,
+                )
+                self._phase = ResearchPhase.AWAITING_CLARIFICATIONS
+                self._message = "Waiting for your clarification answers..."
+
+                await workflow.execute_activity(
+                    "publish_progress_activity",
+                    PublishProgressInput(
+                        thread_id=self._thread_id,
+                        turn_id=turn_id,
+                        query=query,
+                        phase=ResearchPhase.AWAITING_CLARIFICATIONS,
+                        message=self._message,
+                    ),
+                    start_to_close_timeout=timedelta(seconds=30),
+                    retry_policy=_ACTIVITY_RETRY,
+                )
+                await workflow.execute_activity(
+                    "persist_clarifications_widget_activity",
+                    PersistClarificationsWidgetInput(
+                        thread_id=self._thread_id,
+                        turn_id=turn_id,
+                        intro=clarifications.intro,
+                        questions=list(clarifications.questions),
+                        state="pending",
+                    ),
+                    result_type=str,
+                    start_to_close_timeout=timedelta(seconds=30),
+                    retry_policy=_ACTIVITY_RETRY,
+                )
+
+                await workflow.wait_condition(
+                    lambda: self._workflow_ended
+                    or self._clarification_submission is not None
+                )
+
+                if self._workflow_ended:
+                    self._pending_clarification = None
+                    self._phase = ResearchPhase.INTERRUPTED
+                    self._message = "Research workflow ended."
+                    return
+
+                submission = self._clarification_submission
+                assert submission is not None
+                self._pending_clarification = None
+
+                await workflow.execute_activity(
+                    "persist_clarifications_widget_activity",
+                    PersistClarificationsWidgetInput(
+                        thread_id=self._thread_id,
+                        turn_id=turn_id,
+                        intro=clarifications.intro,
+                        questions=list(clarifications.questions),
+                        state="skipped" if submission.skipped else "submitted",
+                        answers=dict(submission.answers),
+                    ),
+                    result_type=str,
+                    start_to_close_timeout=timedelta(seconds=30),
+                    retry_policy=_ACTIVITY_RETRY,
+                )
+
+                self._phase = ResearchPhase.PLANNING
+                self._message = "Enhancing research brief from your answers..."
+                await workflow.execute_activity(
+                    "publish_progress_activity",
+                    PublishProgressInput(
+                        thread_id=self._thread_id,
+                        turn_id=turn_id,
+                        query=query,
+                        phase=ResearchPhase.PLANNING,
+                        message=self._message,
+                    ),
+                    start_to_close_timeout=timedelta(seconds=30),
+                    retry_policy=_ACTIVITY_RETRY,
+                )
+                brief = await manager.enhance_query(
+                    query,
+                    list(clarifications.questions),
+                    dict(submission.answers),
+                    skipped=submission.skipped,
+                    conversation_id=self._openai_conversation_id,
+                )
+            else:
+                # Branch 3: Specific research query already enhanced by InstructionAgent
+                assert outcome.brief is not None
+                brief = outcome.brief
+
+            # Plan targeted web searches
             self._phase = ResearchPhase.PLANNING
-            self._message = "Planning research sub-questions..."
+            self._message = "Planning targeted web searches..."
             await workflow.execute_activity(
                 "publish_progress_activity",
                 PublishProgressInput(
                     thread_id=self._thread_id,
                     turn_id=turn_id,
-                    query=query,
+                    query=brief.topic or query,
                     phase=ResearchPhase.PLANNING,
                     message=self._message,
                 ),
@@ -259,23 +429,19 @@ class AgentThreadWorkflow:
                 retry_policy=_ACTIVITY_RETRY,
             )
 
-            if not resolve_turn:
-                # Replay the planner for turns already started by an older worker.
-                await self._flush_unrecorded_turns()
-                plan = await workflow.execute_activity(
-                    "plan_research_activity",
-                    plan_input,
-                    result_type=ResearchPlan,
-                    start_to_close_timeout=timedelta(seconds=60),
-                    retry_policy=_ACTIVITY_RETRY,
-                )
-                response_received = True
-            query = plan.query or query
+            search_plan = await manager.plan_searches(brief)
+            query = search_plan.topic or brief.topic or query
             self._active_query = query
-            sub_questions = list(plan.sub_questions)
+            planned_items = list(search_plan.searches)
+            if not planned_items:
+                planned_items = [
+                    WebSearchItem(query=query, reason="Primary web research query")
+                ]
+            sub_questions = [item.query for item in planned_items]
             self._active_sub_questions = list(sub_questions)
             selected_depth = "standard"
 
+            # Plan Approval Gate
             if require_approval:
                 approval_id = f"apr_{workflow.uuid4().hex[:12]}"
                 widget_id = f"wgt_approval_{turn_id}"
@@ -286,7 +452,7 @@ class AgentThreadWorkflow:
                     widget_item_id=widget_id,
                 )
                 self._phase = ResearchPhase.AWAITING_APPROVAL
-                self._message = "Waiting for your approval on the research plan..."
+                self._message = "Waiting for your approval on the web search plan..."
 
                 await workflow.execute_activity(
                     "publish_progress_activity",
@@ -302,7 +468,6 @@ class AgentThreadWorkflow:
                     start_to_close_timeout=timedelta(seconds=30),
                     retry_policy=_ACTIVITY_RETRY,
                 )
-
                 await workflow.execute_activity(
                     "persist_approval_widget_activity",
                     PersistApprovalWidgetInput(
@@ -317,8 +482,14 @@ class AgentThreadWorkflow:
                 )
 
                 await workflow.wait_condition(
-                    lambda: self._approval_decision is not None
+                    lambda: self._workflow_ended or self._approval_decision is not None
                 )
+
+                if self._workflow_ended:
+                    self._pending_approval = None
+                    self._phase = ResearchPhase.INTERRUPTED
+                    self._message = "Research workflow ended."
+                    return
 
                 decision = self._approval_decision
                 assert decision is not None
@@ -360,11 +531,21 @@ class AgentThreadWorkflow:
                     )
                     return
 
+                reason_by_query = {item.query: item.reason for item in planned_items}
                 if decision.sub_questions:
                     sub_questions = list(decision.sub_questions)
                 extra = decision.extra_focus.strip()
                 if extra and extra not in sub_questions:
                     sub_questions.append(extra)
+                planned_items = [
+                    WebSearchItem(
+                        query=q,
+                        reason=reason_by_query.get(
+                            q, "User-requested additional focus area"
+                        ),
+                    )
+                    for q in sub_questions
+                ]
                 selected_depth = decision.depth
                 self._active_sub_questions = list(sub_questions)
 
@@ -383,9 +564,11 @@ class AgentThreadWorkflow:
                     retry_policy=_ACTIVITY_RETRY,
                 )
 
-            total = len(sub_questions)
+            # Parallel Web Search Fan-Out via SearchAgent (WebSearchTool)
+            enhanced_prompt = brief.instructions.strip()
+            total = len(planned_items)
             self._phase = ResearchPhase.RESEARCHING
-            self._message = f"Researching {total} sub-questions in parallel (0/{total})..."
+            self._message = f"Searching the web across {total} queries (0/{total})..."
             await workflow.execute_activity(
                 "publish_progress_activity",
                 PublishProgressInput(
@@ -394,6 +577,7 @@ class AgentThreadWorkflow:
                     query=query,
                     phase=ResearchPhase.RESEARCHING,
                     message=self._message,
+                    enhanced_prompt=enhanced_prompt,
                     sub_questions=sub_questions,
                     completed_sub_questions=0,
                     total_sub_questions=total,
@@ -404,26 +588,11 @@ class AgentThreadWorkflow:
                 retry_policy=_ACTIVITY_RETRY,
             )
 
-            completed_count = 0
-
-            async def _investigate(sub_q: str) -> ResearchFinding:
-                nonlocal completed_count
-                finding: ResearchFinding = await workflow.execute_activity(
-                    "investigate_sub_question_activity",
-                    GatherFindingInput(
-                        query=query,
-                        sub_question=sub_q,
-                        depth=selected_depth,
-                        conversation_id=self._openai_conversation_id,
-                    ),
-                    result_type=ResearchFinding,
-                    start_to_close_timeout=timedelta(seconds=90),
-                    retry_policy=_ACTIVITY_RETRY,
-                )
-
-                completed_count += 1
+            async def _on_search_complete(
+                completed: int, total_count: int, _finding: ResearchFinding | None
+            ) -> None:
                 self._message = (
-                    f"Researching sub-questions ({completed_count}/{total} completed)..."
+                    f"Searching the web ({completed}/{total_count} completed)..."
                 )
                 await workflow.execute_activity(
                     "publish_progress_activity",
@@ -433,23 +602,27 @@ class AgentThreadWorkflow:
                         query=query,
                         phase=ResearchPhase.RESEARCHING,
                         message=self._message,
+                        enhanced_prompt=enhanced_prompt,
                         sub_questions=sub_questions,
-                        completed_sub_questions=completed_count,
-                        total_sub_questions=total,
+                        completed_sub_questions=completed,
+                        total_sub_questions=total_count,
                         update_progress_widget=True,
                         is_new_progress_widget=False,
                     ),
                     start_to_close_timeout=timedelta(seconds=30),
                     retry_policy=_ACTIVITY_RETRY,
                 )
-                return finding
 
-            findings = list(
-                await asyncio.gather(*(_investigate(q) for q in sub_questions))
+            findings = await manager.perform_searches(
+                brief,
+                planned_items,
+                depth=selected_depth,
+                on_search_complete=_on_search_complete,
             )
 
+            # Synthesize comprehensive report via WriterAgent
             self._phase = ResearchPhase.SYNTHESIZING
-            self._message = "Synthesizing findings into a structured report..."
+            self._message = "Synthesizing web findings into a deep research report..."
             await workflow.execute_activity(
                 "publish_progress_activity",
                 PublishProgressInput(
@@ -458,6 +631,7 @@ class AgentThreadWorkflow:
                     query=query,
                     phase=ResearchPhase.SYNTHESIZING,
                     message=self._message,
+                    enhanced_prompt=enhanced_prompt,
                     sub_questions=sub_questions,
                     completed_sub_questions=total,
                     total_sub_questions=total,
@@ -468,17 +642,24 @@ class AgentThreadWorkflow:
                 retry_policy=_ACTIVITY_RETRY,
             )
 
+            report_data = await manager.write_report(
+                brief, findings, depth=selected_depth
+            )
+
             await workflow.execute_activity(
-                "synthesize_report_activity",
-                SynthesizeReportInput(
+                "publish_report_activity",
+                PublishReportInput(
                     thread_id=self._thread_id,
                     turn_id=turn_id,
                     query=query,
+                    enhanced_prompt=enhanced_prompt,
                     findings=findings,
+                    report=report_data.markdown_report,
+                    follow_up_questions=list(report_data.follow_up_questions),
                     conversation_id=self._openai_conversation_id,
                 ),
                 result_type=str,
-                start_to_close_timeout=timedelta(seconds=120),
+                start_to_close_timeout=timedelta(seconds=60),
                 retry_policy=_ACTIVITY_RETRY,
             )
 
@@ -492,6 +673,7 @@ class AgentThreadWorkflow:
                     query=query,
                     phase=ResearchPhase.COMPLETED,
                     message=self._message,
+                    enhanced_prompt=enhanced_prompt,
                     sub_questions=sub_questions,
                     completed_sub_questions=total,
                     total_sub_questions=total,
@@ -512,14 +694,16 @@ class AgentThreadWorkflow:
                 start_to_close_timeout=timedelta(seconds=30),
                 retry_policy=_ACTIVITY_RETRY,
             )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             if not response_received:
                 self._unrecorded_turns.append((query, str(exc)))
                 try:
                     await self._flush_unrecorded_turns(best_effort=True)
-                except Exception:
+                except Exception as flush_exc:  # noqa: BLE001
                     # Keep in durable workflow state to flush on the next Turn.
-                    pass
+                    workflow.logger.warning(
+                        "Best-effort failed-turn flush deferred: %s", flush_exc
+                    )
             self._phase = ResearchPhase.FAILED
             if research_started:
                 self._message = f"Deep research failed: {exc}"

@@ -1,0 +1,71 @@
+{
+  "version": "1.0",
+  "name": "research_clarifications",
+  "template": "{% if state == \"pending\" %}{\n  \"type\": \"Card\",\n  \"size\": \"lg\",\n  \"padding\": 4,\n  \"background\": \"#F4F3EC\",\n  \"asForm\": true,\n  \"status\": {\n    \"text\": \"Human-in-the-Loop • Quick Clarifications\",\n    \"icon\": \"compass\"\n  },\n  \"children\": [\n    {\n      \"type\": \"Row\",\n      \"justify\": \"between\",\n      \"align\": \"center\",\n      \"gap\": 2,\n      \"wrap\": \"wrap\",\n      \"children\": [\n        {\n          \"type\": \"Title\",\n          \"value\": \"Clarify Your Research Goals\",\n          \"size\": \"md\",\n          \"weight\": \"semibold\",\n          \"color\": \"#131420\"\n        },\n        {\n          \"type\": \"Badge\",\n          \"label\": \"Awaiting Input\",\n          \"color\": \"warning\",\n          \"variant\": \"soft\",\n          \"size\": \"sm\",\n          \"pill\": true\n        }\n      ]\n    }{% if intro %},\n    {\n      \"type\": \"Text\",\n      \"value\": {{ intro | tojson }},\n      \"size\": \"sm\",\n      \"color\": \"#4B4C5E\"\n    }{% endif %},\n    {\n      \"type\": \"Col\",\n      \"gap\": 3,\n      \"children\": [\n        {% for q in questions %}\n        {\n          \"type\": \"Col\",\n          \"gap\": 2,\n          \"background\": \"#FFFFFF\",\n          \"padding\": 3,\n          \"radius\": \"xl\",\n          \"border\": { \"size\": 1, \"color\": \"#E3E0D5\" },\n          \"children\": [\n            {\n              \"type\": \"Label\",\n              \"value\": {{ q.question | tojson }},\n              \"fieldName\": {{ q.id | tojson }},\n              \"size\": \"sm\",\n              \"weight\": \"semibold\",\n              \"color\": \"#131420\"\n            },\n            {% if q.kind == \"single_select\" and q.options %}\n            {\n              \"type\": \"RadioGroup\",\n              \"name\": {{ q.id | tojson }},\n              \"direction\": \"col\",\n              \"defaultValue\": {{ q.options[0].value | tojson }},\n              \"options\": [\n                {% for opt in q.options %}\n                { \"value\": {{ opt.value | tojson }}, \"label\": {{ opt.label | tojson }} }{% if not loop.last %},{% endif %}\n                {% endfor %}\n              ]\n            }\n            {% elif q.kind == \"multi_select\" and q.options %}\n            {\n              \"type\": \"Col\",\n              \"gap\": 1,\n              \"children\": [\n                {% for opt in q.options %}\n                {\n                  \"type\": \"Checkbox\",\n                  \"name\": {{ (q.id ~ \"__opt__\" ~ loop.index0) | tojson }},\n                  \"label\": {{ opt.label | tojson }},\n                  \"defaultChecked\": false\n                }{% if not loop.last %},{% endif %}\n                {% endfor %}\n              ]\n            }\n            {% elif q.kind == \"long_text\" %}\n            {\n              \"type\": \"Textarea\",\n              \"name\": {{ q.id | tojson }},\n              \"placeholder\": {{ (q.placeholder or \"Share details, constraints, or context...\") | tojson }},\n              \"rows\": 3,\n              \"variant\": \"outline\"\n            }\n            {% else %}\n            {\n              \"type\": \"Input\",\n              \"name\": {{ q.id | tojson }},\n              \"placeholder\": {{ (q.placeholder or \"Type your answer...\") | tojson }},\n              \"size\": \"md\",\n              \"variant\": \"outline\"\n            }\n            {% endif %}\n          ]\n        }{% if not loop.last %},{% endif %}\n        {% endfor %}\n      ]\n    }\n  ],\n  \"confirm\": {\n    \"label\": \"Submit & Enhance Brief\",\n    \"action\": {\n      \"type\": {{ submit_action_type | tojson }},\n      \"payload\": {\n        \"workflow_id\": {{ workflow_id | tojson }},\n        \"questions\": {{ questions | tojson }}\n      }\n    }\n  },\n  \"cancel\": {\n    \"label\": \"Skip & Proceed\",\n    \"action\": {\n      \"type\": {{ skip_action_type | tojson }},\n      \"payload\": {\n        \"workflow_id\": {{ workflow_id | tojson }}\n      }\n    }\n  }\n}{% else %}{\n  \"type\": \"Card\",\n  \"size\": \"lg\",\n  \"padding\": 4,\n  \"background\": \"#F4F3EC\",\n  \"status\": {\n    \"text\": {{ status_text | tojson }},\n    \"icon\": {{ status_icon | tojson }}\n  },\n  \"children\": [\n    {\n      \"type\": \"Row\",\n      \"justify\": \"between\",\n      \"align\": \"center\",\n      \"gap\": 2,\n      \"wrap\": \"wrap\",\n      \"children\": [\n        {\n          \"type\": \"Title\",\n          \"value\": \"Research Clarifications\",\n          \"size\": \"md\",\n          \"weight\": \"semibold\",\n          \"color\": \"#131420\"\n        },\n        {\n          \"type\": \"Badge\",\n          \"label\": {{ badge_label | tojson }},\n          \"color\": {{ badge_color | tojson }},\n          \"variant\": \"soft\",\n          \"size\": \"sm\",\n          \"pill\": true\n        }\n      ]\n    }{% if state == \"submitted\" and answer_rows %},\n    { \"type\": \"Divider\", \"color\": \"#E3E0D5\", \"flush\": true },\n    {\n      \"type\": \"Col\",\n      \"gap\": 2,\n      \"background\": \"#FFFFFF\",\n      \"padding\": 3,\n      \"radius\": \"xl\",\n      \"border\": { \"size\": 1, \"color\": \"#E3E0D5\" },\n      \"children\": [\n        {% for row in answer_rows %}\n        {\n          \"type\": \"Col\",\n          \"gap\": 1,\n          \"children\": [\n            {\n              \"type\": \"Text\",\n              \"value\": {{ row.question | tojson }},\n              \"size\": \"sm\",\n              \"weight\": \"semibold\",\n              \"color\": \"#131420\"\n            },\n            {\n              \"type\": \"Text\",\n              \"value\": {{ row.answer | tojson }},\n              \"size\": \"sm\",\n              \"color\": \"#4B4C5E\"\n            }\n          ]\n        }{% if not loop.last %},{% endif %}\n        {% endfor %}\n      ]\n    }{% endif %}\n  ]\n}{% endif %}",
+  "jsonSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+      "workflow_id",
+      "intro",
+      "questions",
+      "state",
+      "submit_action_type",
+      "skip_action_type",
+      "badge_label",
+      "badge_color",
+      "status_icon",
+      "status_text",
+      "answer_rows"
+    ],
+    "properties": {
+      "workflow_id": { "type": "string" },
+      "intro": { "type": "string" },
+      "questions": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "required": ["id", "question", "kind", "options", "placeholder", "required"],
+          "properties": {
+            "id": { "type": "string" },
+            "question": { "type": "string" },
+            "kind": { "type": "string", "enum": ["single_select", "multi_select", "short_text", "long_text"] },
+            "options": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": ["value", "label"],
+                "properties": {
+                  "value": { "type": "string" },
+                  "label": { "type": "string" },
+                  "description": { "type": ["string", "null"] }
+                }
+              }
+            },
+            "placeholder": { "type": "string" },
+            "required": { "type": "boolean" }
+          }
+        }
+      },
+      "state": { "type": "string", "enum": ["pending", "submitted", "skipped"] },
+      "submit_action_type": { "type": "string" },
+      "skip_action_type": { "type": "string" },
+      "badge_label": { "type": "string" },
+      "badge_color": { "type": "string" },
+      "status_icon": { "type": "string" },
+      "status_text": { "type": "string" },
+      "answer_rows": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "required": ["question", "answer"],
+          "properties": {
+            "question": { "type": "string" },
+            "answer": { "type": "string" }
+          }
+        }
+      }
+    }
+  }
+}
