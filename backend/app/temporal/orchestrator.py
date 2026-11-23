@@ -22,10 +22,6 @@ class ThreadOrchestrator(Protocol):
         self, thread_id: str, msg: IncomingMessage
     ) -> ThreadWorkflowState: ...
 
-    async def cancel_queued(
-        self, thread_id: str, message_id: str
-    ) -> ThreadWorkflowState: ...
-
     async def submit_approval(
         self, thread_id: str, decision: ApprovalDecision
     ) -> None: ...
@@ -51,7 +47,6 @@ class TemporalThreadOrchestrator:
         self, thread_id: str, msg: IncomingMessage
     ) -> ThreadWorkflowState:
         wf_id = thread_workflow_id(thread_id)
-        signal_name = "steer" if msg.mode == "steer" else "enqueue_message"
         handle = await self._client.start_workflow(
             AgentThreadWorkflow.run,
             AgentThreadInput(
@@ -60,22 +55,10 @@ class TemporalThreadOrchestrator:
             ),
             id=wf_id,
             task_queue=self._task_queue,
-            start_signal=signal_name,
+            start_signal="submit_message",
             start_signal_args=[msg],
         )
         return await handle.query(AgentThreadWorkflow.get_state)
-
-    async def cancel_queued(
-        self, thread_id: str, message_id: str
-    ) -> ThreadWorkflowState:
-        handle = self._client.get_workflow_handle(thread_workflow_id(thread_id))
-        try:
-            await handle.signal(AgentThreadWorkflow.cancel_queued, message_id)
-            return await handle.query(AgentThreadWorkflow.get_state)
-        except RPCError as exc:
-            if exc.status == RPCStatusCode.NOT_FOUND:
-                return ThreadWorkflowState(thread_id=thread_id)
-            raise
 
     async def submit_approval(
         self, thread_id: str, decision: ApprovalDecision

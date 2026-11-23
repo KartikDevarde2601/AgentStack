@@ -1,15 +1,7 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { ChatKit, useChatKit } from '@openai/chatkit-react';
-import {
-  cancelQueuedMessage,
-  CHATKIT_API_URL,
-  CHATKIT_DOMAIN_KEY,
-  getThreadState,
-  sendTurnMessage,
-} from '../api/threads';
+import { CHATKIT_API_URL, CHATKIT_DOMAIN_KEY } from '../api/threads';
 import { CHATKIT_FOODWORKS_THEME } from '../theme/foodworks';
-import type { QueuedMessage, TurnMessageMode } from '../types/threads';
-import { MidTurnControlBar } from './MidTurnControlBar';
 
 const RESUME_RESEARCH_ACTION_TYPE = 'research.resume';
 const FETCH_UPDATES_CACHE_TTL_MS = 5_500;
@@ -54,11 +46,6 @@ const ACTIVE_PHASES = new Set([
   'synthesizing',
 ]);
 
-const CONTROL_BAR_PHASES = new Set([
-  ...ACTIVE_PHASES,
-  'awaiting_approval',
-]);
-
 export function ResearchChatPane({
   activeThreadId,
   activeThreadPhase,
@@ -71,9 +58,6 @@ export function ResearchChatPane({
   const [isReady, setIsReady] = useState(false);
   const [loadedThreadId, setLoadedThreadId] = useState<string | null>(null);
   const [isResponding, setIsResponding] = useState(false);
-  const [queuedMessages, setQueuedMessages] = useState<QueuedMessage[]>([]);
-  const [isSubmittingMidTurn, setIsSubmittingMidTurn] = useState(false);
-  const [midTurnError, setMidTurnError] = useState<string | null>(null);
 
   const isReadyRef = useRef(false);
   const isRespondingRef = useRef(false);
@@ -162,45 +146,11 @@ export function ResearchChatPane({
     syncedThreadIdRef.current = activeThreadId;
     setLoadedThreadId(null);
     resumedThreadIdRef.current = null;
-    setQueuedMessages([]);
-    setMidTurnError(null);
     void setThreadId(activeThreadId).catch(() => {});
   }, [activeThreadId, setThreadId]);
 
   const normalizedPhase = (activeThreadPhase ?? '').toLowerCase();
   const isActivePhase = ACTIVE_PHASES.has(normalizedPhase);
-  const showControlBar =
-    Boolean(activeThreadId) &&
-    (isResponding ||
-      isStreamingLocally ||
-      CONTROL_BAR_PHASES.has(normalizedPhase) ||
-      queuedMessages.length > 0);
-
-  useEffect(() => {
-    if (!activeThreadId || !showControlBar) {
-      setQueuedMessages([]);
-      return;
-    }
-    let cancelled = false;
-    const syncState = async () => {
-      try {
-        const state = await getThreadState(activeThreadId);
-        if (!cancelled) {
-          setQueuedMessages(state.queued_messages ?? []);
-        }
-      } catch {
-        // Ignore transient polling failures
-      }
-    };
-    void syncState();
-    const timer = window.setInterval(() => {
-      void syncState();
-    }, 2_000);
-    return () => {
-      cancelled = true;
-      window.clearInterval(timer);
-    };
-  }, [activeThreadId, showControlBar]);
 
   useEffect(() => {
     if (!activeThreadId || !isActivePhase) {
@@ -269,63 +219,12 @@ export function ResearchChatPane({
     }
   }, [refreshNonce, fetchUpdates, setThreadId]);
 
-  const handleMidTurnSend = useCallback(
-    async (text: string, mode: TurnMessageMode) => {
-      if (!activeThreadId) return;
-      setIsSubmittingMidTurn(true);
-      setMidTurnError(null);
-      try {
-        const res = await sendTurnMessage(activeThreadId, text, mode);
-        setQueuedMessages(res.state.queued_messages ?? []);
-        if (mode === 'steer' && !isRespondingRef.current && isReadyRef.current) {
-          void sendCustomAction({
-            type: RESUME_RESEARCH_ACTION_TYPE,
-            payload: { thread_id: activeThreadId },
-          }).catch(() => {});
-        }
-      } catch (err) {
-        setMidTurnError(
-          err instanceof Error ? err.message : 'Failed to send message',
-        );
-      } finally {
-        setIsSubmittingMidTurn(false);
-      }
-    },
-    [activeThreadId, sendCustomAction],
-  );
-
-  const handleCancelQueued = useCallback(
-    async (messageId: string) => {
-      if (!activeThreadId) return;
-      setMidTurnError(null);
-      try {
-        const nextState = await cancelQueuedMessage(activeThreadId, messageId);
-        setQueuedMessages(nextState.queued_messages ?? []);
-      } catch (err) {
-        setMidTurnError(
-          err instanceof Error ? err.message : 'Failed to cancel queued message',
-        );
-      }
-    },
-    [activeThreadId],
-  );
-
   return (
     <main
       className="chat-pane"
       data-chat-state={activeThreadId ? 'active' : 'empty'}
       aria-label="Research conversation"
     >
-      {showControlBar && (
-        <MidTurnControlBar
-          phaseLabel={normalizedPhase || (isResponding ? 'streaming' : 'running')}
-          queuedMessages={queuedMessages}
-          isSubmitting={isSubmittingMidTurn}
-          error={midTurnError}
-          onSend={handleMidTurnSend}
-          onCancelQueued={handleCancelQueued}
-        />
-      )}
       <ChatKit control={control} className="chatkit-surface" />
     </main>
   );

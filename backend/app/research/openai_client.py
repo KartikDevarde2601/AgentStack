@@ -16,10 +16,6 @@ class ResearchLLMClient(Protocol):
         self, conversation_id: str, messages: list[dict[str, str]]
     ) -> None: ...
 
-    async def close_dangling_tool_calls(
-        self, conversation_id: str, call_ids: list[str]
-    ) -> None: ...
-
     async def generate_research_plan(
         self, query: str, *, conversation_id: str | None = None
     ) -> ResearchPlan: ...
@@ -79,24 +75,6 @@ class OpenAIResearchClient:
         ]
         if not items:
             return
-        await self._client.conversations.items.create(
-            conversation_id=conversation_id,
-            items=items,  # type: ignore[arg-type]
-        )
-
-    async def close_dangling_tool_calls(
-        self, conversation_id: str, call_ids: list[str]
-    ) -> None:
-        if not conversation_id or not call_ids:
-            return
-        items: list[dict[str, Any]] = [
-            {
-                "type": "function_call_output",
-                "call_id": call_id,
-                "output": json.dumps({"status": "cancelled_by_user"}),
-            }
-            for call_id in call_ids
-        ]
         await self._client.conversations.items.create(
             conversation_id=conversation_id,
             items=items,  # type: ignore[arg-type]

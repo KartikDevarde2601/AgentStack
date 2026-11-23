@@ -74,11 +74,6 @@ class ThreadPersistenceStore(Protocol):
     ) -> ResearchRunRecord: ...
 
 
-class CloseToolCallsInput(BaseModel):
-    conversation_id: str
-    call_ids: list[str] = Field(default_factory=list)
-
-
 class RecordFailedTurnsInput(BaseModel):
     conversation_id: str
     turns: list[tuple[str, str]] = Field(default_factory=list)
@@ -185,14 +180,6 @@ class ThreadActivities:
         conversation_id = await self._client.create_conversation()
         await self._store.set_openai_conversation_id(thread_id, conversation_id)
         return conversation_id
-
-    @activity.defn(name="close_dangling_tool_calls_activity")
-    async def close_dangling_tool_calls_activity(
-        self, params: CloseToolCallsInput
-    ) -> None:
-        await self._client.close_dangling_tool_calls(
-            params.conversation_id, params.call_ids
-        )
 
     @activity.defn(name="record_failed_turns_activity")
     async def record_failed_turns_activity(
@@ -495,28 +482,15 @@ class ThreadActivities:
             )
         )
 
-    @activity.defn(name="persist_interrupted_or_final_activity")
-    async def persist_interrupted_or_final_activity(
+    @activity.defn(name="persist_final_item_activity")
+    async def persist_final_item_activity(
         self, params: PersistFinalItemInput
     ) -> None:
-        final_text = params.text
-        if params.phase == ResearchPhase.INTERRUPTED:
-            streamed = (
-                await self._event_bus.get_turn_streamed_text(
-                    params.thread_id, params.turn_id
-                )
-            ).strip()
-            if streamed:
-                final_text = (
-                    f"{streamed}\n\n---\n"
-                    "_Interrupted by a new steering instruction._"
-                )
-
         item = AssistantMessageItem(
             id=turn_assistant_item_id(params.turn_id),
             thread_id=params.thread_id,
             created_at=datetime.now(UTC),
-            content=[AssistantMessageContent(text=final_text)],
+            content=[AssistantMessageContent(text=params.text)],
         )
         await self._store.save_item(params.thread_id, item, RequestContext())
         await self._store.upsert_research_run(
@@ -526,7 +500,7 @@ class ThreadActivities:
             phase=params.phase,
             message=params.message,
             sub_questions=params.sub_questions,
-            report=final_text if params.phase != ResearchPhase.FAILED else None,
+            report=params.text if params.phase != ResearchPhase.FAILED else None,
             error=params.error,
         )
         await self._publish(

@@ -238,9 +238,6 @@ class InMemoryChatKitStore(Store[RequestContext]):
 
 
 class FakeLLM:
-    def __init__(self) -> None:
-        self.closed_tool_calls: list[tuple[str, list[str]]] = []
-
     async def create_conversation(self) -> str:
         return f"conv_{uuid.uuid4().hex[:8]}"
 
@@ -248,11 +245,6 @@ class FakeLLM:
         self, conversation_id: str, messages: list[dict[str, str]]
     ) -> None:
         return None
-
-    async def close_dangling_tool_calls(
-        self, conversation_id: str, call_ids: list[str]
-    ) -> None:
-        self.closed_tool_calls.append((conversation_id, list(call_ids)))
 
     async def generate_research_plan(
         self, query: str, *, conversation_id: str | None = None
@@ -303,7 +295,6 @@ def _parse_sse_events(body: str) -> list[dict]:
 def _worker_activities(activities: ThreadActivities) -> list:
     return [
         activities.ensure_openai_conversation_activity,
-        activities.close_dangling_tool_calls_activity,
         activities.record_failed_turns_activity,
         activities.persist_user_message_activity,
         activities.publish_progress_activity,
@@ -311,14 +302,14 @@ def _worker_activities(activities: ThreadActivities) -> list:
         activities.plan_research_activity,
         activities.investigate_sub_question_activity,
         activities.synthesize_report_activity,
-        activities.persist_interrupted_or_final_activity,
+        activities.persist_final_item_activity,
         activities.publish_turn_end_activity,
         activities.prune_thread_events_activity,
     ]
 
 
 @pytest.mark.asyncio
-async def test_health_threads_crud_approval_streaming_and_midrun_endpoints() -> None:
+async def test_health_threads_crud_approval_and_streaming() -> None:
     store = InMemoryChatKitStore()
     bus = InMemoryThreadEventBus()
     llm = FakeLLM()
@@ -446,20 +437,63 @@ async def test_health_threads_crud_approval_streaming_and_midrun_endpoints() -> 
                         in assistant_done[0]["item"]["content"][0]["text"]
                     )
 
-                    # 6. Mid-run REST API: queue & cancel
-                    post_res = await client.post(
-                        f"/api/threads/{thread_id}/messages",
-                        json={"text": "Follow-up via REST", "mode": "steer"},
-                    )
-                    assert post_res.status_code == 200
-                    assert post_res.json()["mode"] == "steer"
-
-                    # Wait briefly for Turn 2 to hit AWAITING_APPROVAL, then cancel cleanly
+                    # 6. Follow-up turn via ChatKit pauses at Approval Gate; sending another message while pending reminds user to approve/cancel first
                     for _ in range(50):
                         st = (await client.get(f"/api/threads/{thread_id}/state")).json()
-                        if st["phase"] == "awaiting_approval":
+                        if st["phase"] == "idle":
                             break
                         await asyncio.sleep(0.02)
+
+                    followup_res = await client.post(
+                        "/chatkit",
+                        json={
+                            "type": "threads.add_user_message",
+                            "params": {
+                                "thread_id": thread_id,
+                                "input": {
+                                    "content": [
+                                        {
+                                            "type": "input_text",
+                                            "text": "Follow-up research question",
+                                        }
+                                    ],
+                                    "attachments": [],
+                                    "inference_options": {},
+                                },
+                            },
+                        },
+                    )
+                    assert followup_res.status_code == 200
+                    st = (await client.get(f"/api/threads/{thread_id}/state")).json()
+                    assert st["phase"] == "awaiting_approval"
+
+                    blocked_res = await client.post(
+                        "/chatkit",
+                        json={
+                            "type": "threads.add_user_message",
+                            "params": {
+                                "thread_id": thread_id,
+                                "input": {
+                                    "content": [
+                                        {
+                                            "type": "input_text",
+                                            "text": "Another prompt while waiting",
+                                        }
+                                    ],
+                                    "attachments": [],
+                                    "inference_options": {},
+                                },
+                            },
+                        },
+                    )
+                    assert blocked_res.status_code == 200
+                    blocked_events = _parse_sse_events(blocked_res.text)
+                    assert any(
+                        e["type"] == "thread.item.done"
+                        and e["item"]["type"] == "assistant_message"
+                        and "approve or cancel" in e["item"]["content"][0]["text"].lower()
+                        for e in blocked_events
+                    )
 
                     reject_res = await client.post(
                         "/chatkit",

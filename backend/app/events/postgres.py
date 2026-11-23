@@ -115,36 +115,6 @@ class PostgresThreadEventBus:
                 row = await cur.fetchone()
         return int(row["max_seq"]) if row is not None else 0
 
-    async def get_turn_streamed_text(self, thread_id: str, turn_id: str) -> str:
-        async with self._pool.connection() as conn:
-            async with conn.cursor(row_factory=dict_row) as cur:
-                await cur.execute(
-                    """
-                    SELECT payload, activity_id, attempt
-                    FROM run_events
-                    WHERE thread_id = %s AND turn_id = %s AND kind = %s
-                    ORDER BY seq ASC
-                    """,
-                    (thread_id, turn_id, ThreadEventKind.TEXT_DELTA.value),
-                )
-                rows = await cur.fetchall()
-        highest_attempt: dict[str, int] = {}
-        for r in rows:
-            act_id = r["activity_id"]
-            if act_id is not None:
-                highest_attempt[act_id] = max(
-                    highest_attempt.get(act_id, 0), int(r["attempt"])
-                )
-        chunks: list[str] = []
-        for r in rows:
-            act_id = r["activity_id"]
-            if act_id is not None and int(r["attempt"]) < highest_attempt[act_id]:
-                continue
-            delta = str((r["payload"] or {}).get("delta") or "")
-            if delta:
-                chunks.append(delta)
-        return "".join(chunks)
-
     async def prune(
         self, *, thread_id: str | None = None, older_than_hours: int = 24
     ) -> int:

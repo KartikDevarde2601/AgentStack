@@ -143,6 +143,28 @@ class DeepResearchChatKitServer(ChatKitServer[RequestContext]):
             )
             return
 
+        state = await self._orchestrator.get_state(thread.id)
+        if state.phase == ResearchPhase.AWAITING_APPROVAL:
+            yield self._assistant_message_event(
+                thread=thread,
+                context=context,
+                text=(
+                    "Please approve or cancel the pending research plan above "
+                    "before starting a new question."
+                ),
+            )
+            return
+        if not state.phase.is_terminal:
+            yield self._assistant_message_event(
+                thread=thread,
+                context=context,
+                text=(
+                    "A research turn is already in progress for this thread. "
+                    "Please wait for it to finish before sending another message."
+                ),
+            )
+            return
+
         after_seq = await self._event_bus.latest_seq(thread.id)
         message_id = (
             input_user_message.id
@@ -158,7 +180,6 @@ class DeepResearchChatKitServer(ChatKitServer[RequestContext]):
             IncomingMessage(
                 message_id=message_id,
                 text=query,
-                mode="queue",
                 already_persisted=True,
             ),
         )
@@ -280,13 +301,15 @@ class DeepResearchChatKitServer(ChatKitServer[RequestContext]):
             "compare_alternatives": f"Compare the main alternatives and tradeoffs for: {base_query}",
         }
         prompt = prompts.get(mode, f"Follow up on: {base_query}")
+        state = await self._orchestrator.get_state(thread.id)
+        if not state.phase.is_terminal:
+            return
         after_seq = await self._event_bus.latest_seq(thread.id)
         await self._orchestrator.send_message(
             thread.id,
             IncomingMessage(
                 message_id=f"msg_{uuid.uuid4().hex[:12]}",
                 text=prompt,
-                mode="queue",
                 already_persisted=False,
             ),
         )
@@ -347,16 +370,6 @@ class DeepResearchChatKitServer(ChatKitServer[RequestContext]):
             elif ev.kind == ThreadEventKind.APPROVAL_PAUSE:
                 return
             elif ev.kind == ThreadEventKind.TURN_END:
-                phase = str(ev.payload.get("phase") or "")
-                # If interrupted by a Steer, stay attached to stream the steering Turn!
-                if phase == ResearchPhase.INTERRUPTED.value:
-                    active_turn_id = None
-                    continue
-                if self._orchestrator is not None:
-                    state = await self._orchestrator.get_state(thread_id)
-                    if state.queued_messages or not state.phase.is_terminal:
-                        active_turn_id = None
-                        continue
                 return
 
     def _assistant_message_event(

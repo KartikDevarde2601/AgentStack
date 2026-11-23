@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import datetime
 from enum import StrEnum
 from typing import Literal
 
@@ -66,17 +66,9 @@ class ResearchProgress(BaseModel):
     error: str | None = None
 
 
-class QueuedMessage(BaseModel):
-    message_id: str
-    text: str
-    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
-    already_persisted: bool = False
-
-
 class IncomingMessage(BaseModel):
     message_id: str
     text: str
-    mode: Literal["queue", "steer"] = "queue"
     already_persisted: bool = False
 
 
@@ -94,7 +86,6 @@ class ThreadWorkflowState(BaseModel):
     phase: ResearchPhase = ResearchPhase.IDLE
     active_turn_id: str | None = None
     message: str = ""
-    queued_messages: list[QueuedMessage] = Field(default_factory=list)
     pending_approval: PendingApproval | None = None
     turns_since_continue: int = 0
 

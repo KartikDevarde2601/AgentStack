@@ -71,7 +71,6 @@ async def run_worker(settings: Settings | None = None) -> None:
             workflows=[AgentThreadWorkflow],
             activities=[
                 activities.ensure_openai_conversation_activity,
-                activities.close_dangling_tool_calls_activity,
                 activities.record_failed_turns_activity,
                 activities.persist_user_message_activity,
                 activities.publish_progress_activity,
@@ -79,7 +78,7 @@ async def run_worker(settings: Settings | None = None) -> None:
                 activities.plan_research_activity,
                 activities.investigate_sub_question_activity,
                 activities.synthesize_report_activity,
-                activities.persist_interrupted_or_final_activity,
+                activities.persist_final_item_activity,
                 activities.publish_turn_end_activity,
                 activities.prune_thread_events_activity,
             ],

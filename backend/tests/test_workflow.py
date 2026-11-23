@@ -6,7 +6,7 @@ from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 
 import pytest
-from chatkit.types import AssistantMessageItem, ThreadItem, UserMessageItem, WidgetItem
+from chatkit.types import AssistantMessageItem, ThreadItem
 from temporalio.contrib.pydantic import pydantic_data_converter
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
@@ -81,17 +81,9 @@ class FakeThreadStore:
 
 
 class FakeResearchLLMClient:
-    def __init__(
-        self,
-        *,
-        investigate_gate: asyncio.Event | None = None,
-        investigate_started: asyncio.Event | None = None,
-    ) -> None:
+    def __init__(self) -> None:
         self.created_conversations: list[str] = []
-        self.closed_tool_calls: list[tuple[str, list[str]]] = []
         self.investigated: list[tuple[str, str, str]] = []
-        self._investigate_gate = investigate_gate
-        self._investigate_started = investigate_started
 
     async def create_conversation(self) -> str:
         conv_id = f"conv_{uuid.uuid4().hex[:8]}"
@@ -102,11 +94,6 @@ class FakeResearchLLMClient:
         self, conversation_id: str, messages: list[dict[str, str]]
     ) -> None:
         return None
-
-    async def close_dangling_tool_calls(
-        self, conversation_id: str, call_ids: list[str]
-    ) -> None:
-        self.closed_tool_calls.append((conversation_id, list(call_ids)))
 
     async def generate_research_plan(
         self, query: str, *, conversation_id: str | None = None
@@ -127,10 +114,6 @@ class FakeResearchLLMClient:
         depth: str = "standard",
         conversation_id: str | None = None,
     ) -> ResearchFinding:
-        if self._investigate_started is not None:
-            self._investigate_started.set()
-        if self._investigate_gate is not None:
-            await self._investigate_gate.wait()
         self.investigated.append((query, sub_question, depth))
         return ResearchFinding(
             sub_question=sub_question,
@@ -157,7 +140,6 @@ class FakeResearchLLMClient:
 def _all_activities(activities: ThreadActivities) -> list:
     return [
         activities.ensure_openai_conversation_activity,
-        activities.close_dangling_tool_calls_activity,
         activities.record_failed_turns_activity,
         activities.persist_user_message_activity,
         activities.publish_progress_activity,
@@ -165,14 +147,14 @@ def _all_activities(activities: ThreadActivities) -> list:
         activities.plan_research_activity,
         activities.investigate_sub_question_activity,
         activities.synthesize_report_activity,
-        activities.persist_interrupted_or_final_activity,
+        activities.persist_final_item_activity,
         activities.publish_turn_end_activity,
         activities.prune_thread_events_activity,
     ]
 
 
 @pytest.mark.asyncio
-async def test_agent_thread_workflow_approval_streaming_and_queue() -> None:
+async def test_agent_thread_workflow_approval_and_streaming() -> None:
     store = FakeThreadStore()
     bus = InMemoryThreadEventBus()
     llm = FakeResearchLLMClient()
@@ -249,7 +231,7 @@ async def test_agent_thread_workflow_approval_streaming_and_queue() -> None:
 
 
 @pytest.mark.asyncio
-async def test_agent_thread_workflow_steer_closes_call_ids_and_preserves_interrupted() -> None:
+async def test_agent_thread_workflow_reject_and_idle_prune() -> None:
     store = FakeThreadStore()
     bus = InMemoryThreadEventBus()
     llm = FakeResearchLLMClient()
@@ -258,105 +240,7 @@ async def test_agent_thread_workflow_steer_closes_call_ids_and_preserves_interru
     async with await WorkflowEnvironment.start_time_skipping(
         data_converter=pydantic_data_converter
     ) as env:
-        task_queue = f"test-steer-{uuid.uuid4().hex[:8]}"
-        orchestrator = TemporalThreadOrchestrator(
-            env.client, task_queue=task_queue, require_approval=True
-        )
-        async with Worker(
-            env.client,
-            task_queue=task_queue,
-            workflows=[AgentThreadWorkflow],
-            activities=_all_activities(activities),
-        ):
-            thread_id = f"thr_{uuid.uuid4().hex[:8]}"
-            await orchestrator.send_message(
-                thread_id,
-                IncomingMessage(
-                    message_id="msg_1",
-                    text="Initial topic",
-                    already_persisted=True,
-                ),
-            )
-
-            state = await orchestrator.get_state(thread_id)
-            for _ in range(100):
-                if state.phase == ResearchPhase.AWAITING_APPROVAL:
-                    break
-                await asyncio.sleep(0.02)
-                state = await orchestrator.get_state(thread_id)
-
-            assert state.pending_approval is not None
-            expected_approval_id = state.pending_approval.approval_id
-
-            # Steer while parked at Approval Gate!
-            await orchestrator.send_message(
-                thread_id,
-                IncomingMessage(
-                    message_id="msg_steer",
-                    text="Pivot to Temporal signals",
-                    mode="steer",
-                    already_persisted=False,
-                ),
-            )
-
-            # Wait for the steering Turn to reach its own Approval Gate.
-            for _ in range(100):
-                state = await orchestrator.get_state(thread_id)
-                if (
-                    state.phase == ResearchPhase.AWAITING_APPROVAL
-                    and state.pending_approval is not None
-                    and state.pending_approval.approval_id != expected_approval_id
-                ):
-                    break
-                await asyncio.sleep(0.02)
-
-            # No fabricated OpenAI call_ids are sent to conversations.items.create.
-            assert llm.closed_tool_calls == []
-
-            # Verify interrupted partial output was preserved and steering user message was persisted.
-            items = store.items[thread_id]
-            interrupted_items = [
-                i
-                for i in items
-                if isinstance(i, AssistantMessageItem)
-                and "Research Interrupted" in i.content[0].text
-            ]
-            assert len(interrupted_items) == 1
-            user_items = [
-                i
-                for i in items
-                if isinstance(i, UserMessageItem) and i.id == "msg_steer"
-            ]
-            assert len(user_items) == 1
-
-            # Reject the second plan to end cleanly.
-            await orchestrator.submit_approval(
-                thread_id, ApprovalDecision(approved=False, reason="Done testing")
-            )
-            for _ in range(100):
-                state = await orchestrator.get_state(thread_id)
-                if state.phase == ResearchPhase.IDLE:
-                    break
-                await asyncio.sleep(0.02)
-            assert state.phase == ResearchPhase.IDLE
-
-
-@pytest.mark.asyncio
-async def test_agent_thread_workflow_queue_cancel_and_idle_prune() -> None:
-    investigate_started = asyncio.Event()
-    investigate_gate = asyncio.Event()
-    store = FakeThreadStore()
-    bus = InMemoryThreadEventBus()
-    llm = FakeResearchLLMClient(
-        investigate_gate=investigate_gate,
-        investigate_started=investigate_started,
-    )
-    activities = ThreadActivities(client=llm, store=store, event_bus=bus)
-
-    async with await WorkflowEnvironment.start_time_skipping(
-        data_converter=pydantic_data_converter
-    ) as env:
-        task_queue = f"test-queue-{uuid.uuid4().hex[:8]}"
+        task_queue = f"test-idle-{uuid.uuid4().hex[:8]}"
         async with Worker(
             env.client,
             task_queue=task_queue,
@@ -369,12 +253,12 @@ async def test_agent_thread_workflow_queue_cancel_and_idle_prune() -> None:
                 AgentThreadWorkflow.run,
                 AgentThreadInput(
                     thread_id=thread_id,
-                    require_approval=False,
+                    require_approval=True,
                     idle_timeout_seconds=1800,
                 ),
                 id=wf_id,
                 task_queue=task_queue,
-                start_signal="enqueue_message",
+                start_signal="submit_message",
                 start_signal_args=[
                     IncomingMessage(
                         message_id="msg_1",
@@ -384,39 +268,29 @@ async def test_agent_thread_workflow_queue_cancel_and_idle_prune() -> None:
                 ],
             )
 
-            await investigate_started.wait()
+            for _ in range(100):
+                state = await handle.query(AgentThreadWorkflow.get_state)
+                if state.phase == ResearchPhase.AWAITING_APPROVAL:
+                    break
+                await asyncio.sleep(0.02)
+            assert state.phase == ResearchPhase.AWAITING_APPROVAL
 
-            # Queue two follow-up messages while Turn 1 is actively researching.
             await handle.signal(
-                AgentThreadWorkflow.enqueue_message,
-                IncomingMessage(message_id="msg_drop", text="Drop me"),
-            )
-            await handle.signal(
-                AgentThreadWorkflow.enqueue_message,
-                IncomingMessage(message_id="msg_keep", text="Turn 2"),
+                AgentThreadWorkflow.submit_approval,
+                ApprovalDecision(approved=False, reason="Cancelled by user"),
             )
 
-            # Cancel msg_drop before Turn 1 finishes.
-            await handle.signal(AgentThreadWorkflow.cancel_queued, "msg_drop")
-            state = await handle.query(AgentThreadWorkflow.get_state)
-            assert [m.message_id for m in state.queued_messages] == ["msg_keep"]
-
-            # msg_keep must NOT be persisted in chatkit_items yet (Q5).
-            assert not any(
-                isinstance(i, UserMessageItem) and i.id == "msg_keep"
-                for i in store.items.get(thread_id, [])
-            )
-
-            # Release Turn 1; Turn 2 should run next, then idle-exit after 30m (time-skipped) and prune run_events.
-            investigate_gate.set()
+            # Workflow returns to IDLE and exits after 30m (time-skipped), pruning run_events.
             await handle.result()
 
             items = store.items[thread_id]
-            user_ids = [i.id for i in items if isinstance(i, UserMessageItem)]
-            assert "msg_keep" in user_ids
-            assert "msg_drop" not in user_ids
-
-            # Idle-exit prunes ephemeral run_events for this thread (Q7).
+            cancelled_items = [
+                i
+                for i in items
+                if isinstance(i, AssistantMessageItem)
+                and "Research Cancelled" in i.content[0].text
+            ]
+            assert len(cancelled_items) == 1
             assert await bus.latest_seq(thread_id) == 0
 
 

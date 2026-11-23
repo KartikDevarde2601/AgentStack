@@ -1,9 +1,8 @@
 from __future__ import annotations
 
 import logging
-import uuid
 from contextlib import asynccontextmanager
-from typing import Any, Literal
+from typing import Any
 
 from chatkit.server import StreamingResult
 from chatkit.store import NotFoundError
@@ -16,7 +15,7 @@ from pydantic import BaseModel
 from app.chatkit_server import DeepResearchChatKitServer
 from app.config import Settings, get_settings
 from app.db.postgres_store import PostgresChatKitStore
-from app.domain import IncomingMessage, RequestContext
+from app.domain import RequestContext
 from app.events import InMemoryThreadEventBus, PostgresThreadEventBus, ThreadEventBus
 from app.temporal.orchestrator import TemporalThreadOrchestrator, ThreadOrchestrator
 from app.temporal.worker import connect_temporal_client
@@ -26,11 +25,6 @@ logger = logging.getLogger(__name__)
 
 class CreateThreadRequest(BaseModel):
     title: str | None = None
-
-
-class TurnMessageRequest(BaseModel):
-    text: str
-    mode: Literal["queue", "steer"] = "queue"
 
 
 def create_app(
@@ -180,46 +174,6 @@ def create_app(
                 status_code=503, detail="Temporal orchestrator unavailable"
             )
         state = await orch.get_state(thread_id)
-        return state.model_dump(mode="json")
-
-    @app.post("/api/threads/{thread_id}/messages")
-    async def post_thread_message(
-        thread_id: str, body: TurnMessageRequest, request: Request
-    ) -> dict[str, Any]:
-        text = body.text.strip()
-        if not text:
-            raise HTTPException(status_code=400, detail="Message text cannot be empty")
-        orch = await _ensure_orchestrator(request)
-        if orch is None:
-            raise HTTPException(
-                status_code=503, detail="Temporal orchestrator unavailable"
-            )
-        msg_id = f"msg_{uuid.uuid4().hex[:12]}"
-        state = await orch.send_message(
-            thread_id,
-            IncomingMessage(
-                message_id=msg_id,
-                text=text,
-                mode=body.mode,
-                already_persisted=False,
-            ),
-        )
-        return {
-            "message_id": msg_id,
-            "mode": body.mode,
-            "state": state.model_dump(mode="json"),
-        }
-
-    @app.delete("/api/threads/{thread_id}/queue/{message_id}")
-    async def cancel_queued_message(
-        thread_id: str, message_id: str, request: Request
-    ) -> dict[str, Any]:
-        orch = await _ensure_orchestrator(request)
-        if orch is None:
-            raise HTTPException(
-                status_code=503, detail="Temporal orchestrator unavailable"
-            )
-        state = await orch.cancel_queued(thread_id, message_id)
         return state.model_dump(mode="json")
 
     @app.get("/health")

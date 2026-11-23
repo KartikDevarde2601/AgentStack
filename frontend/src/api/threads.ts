@@ -1,9 +1,4 @@
-import type {
-  HealthStatus,
-  ThreadSummary,
-  ThreadWorkflowState,
-  TurnMessageMode,
-} from '../types/threads';
+import type { HealthStatus, ThreadSummary } from '../types/threads';
 
 const rawApiBaseUrl =
   import.meta.env.VITE_API_BASE_URL?.trim() || 'http://localhost:8080';
@@ -70,37 +65,4 @@ export async function deleteThread(threadId: string): Promise<void> {
 
 export async function getHealth(): Promise<HealthStatus> {
   return requestJson<HealthStatus>('/health');
-}
-
-export async function getThreadState(
-  threadId: string,
-): Promise<ThreadWorkflowState> {
-  return requestJson<ThreadWorkflowState>(
-    `/api/threads/${encodeURIComponent(threadId)}/state`,
-  );
-}
-
-export async function sendTurnMessage(
-  threadId: string,
-  text: string,
-  mode: TurnMessageMode,
-): Promise<{
-  message_id: string;
-  mode: TurnMessageMode;
-  state: ThreadWorkflowState;
-}> {
-  return requestJson(`/api/threads/${encodeURIComponent(threadId)}/messages`, {
-    method: 'POST',
-    body: JSON.stringify({ text, mode }),
-  });
-}
-
-export async function cancelQueuedMessage(
-  threadId: string,
-  messageId: string,
-): Promise<ThreadWorkflowState> {
-  return requestJson<ThreadWorkflowState>(
-    `/api/threads/${encodeURIComponent(threadId)}/queue/${encodeURIComponent(messageId)}`,
-    { method: 'DELETE' },
-  );
 }

@@ -49,32 +49,6 @@ class InMemoryThreadEventBus:
             return 0
         return events[-1].seq
 
-    async def get_turn_streamed_text(self, thread_id: str, turn_id: str) -> str:
-        from app.events.bus import ThreadEventKind
-
-        chunks: list[str] = []
-        highest_attempt: dict[str, int] = {}
-        events = [
-            ev
-            for ev in self._events_by_thread.get(thread_id, ())
-            if ev.turn_id == turn_id and ev.kind == ThreadEventKind.TEXT_DELTA
-        ]
-        for ev in events:
-            if ev.activity_id is not None:
-                highest_attempt[ev.activity_id] = max(
-                    highest_attempt.get(ev.activity_id, 0), ev.attempt
-                )
-        for ev in events:
-            if (
-                ev.activity_id is not None
-                and ev.attempt < highest_attempt[ev.activity_id]
-            ):
-                continue
-            delta = str(ev.payload.get("delta") or "")
-            if delta:
-                chunks.append(delta)
-        return "".join(chunks)
-
     async def prune(
         self, *, thread_id: str | None = None, older_than_hours: int = 24
     ) -> int:
