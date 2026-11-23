@@ -389,7 +389,7 @@ class ThreadActivities:
             id=item_id,
             thread_id=params.thread_id,
             created_at=created_at,
-            content=[AssistantMessageContent(text="")],
+            content=[],
         )
         await self._event_bus.publish(
             ThreadEvent(
