@@ -39,6 +39,7 @@ from app.domain import (
     ResearchPhase,
 )
 from app.events import ThreadEventBus, ThreadEventKind
+from app.temporal.client import TemporalUnavailableError
 from app.temporal.orchestrator import ThreadOrchestrator, WorkflowActionRejectedError
 from app.widgets import (
     APPROVE_PLAN_ACTION,
@@ -54,6 +55,10 @@ logger = logging.getLogger(__name__)
 RESUME_RESEARCH_ACTION = "research.resume"
 _THREAD_ITEM_ADAPTER = TypeAdapter(ThreadItem)
 _VALID_PROGRESS_ICONS = {"clock", "compass", "search", "sparkle", "check-circle", "bug"}
+_TEMPORAL_UNAVAILABLE_MESSAGE = (
+    "The Temporal workflow service is currently unavailable. "
+    "Please ensure Temporal and the research worker are running and try again."
+)
 
 
 def extract_user_text(item: UserMessageItem | None) -> str:
@@ -81,15 +86,12 @@ class DeepResearchChatKitServer(ChatKitServer[RequestContext]):
         self,
         *,
         store: Store[RequestContext],
-        orchestrator: ThreadOrchestrator | None,
+        orchestrator: ThreadOrchestrator,
         event_bus: ThreadEventBus,
     ) -> None:
         super().__init__(store=store)
         self._orchestrator = orchestrator
         self._event_bus = event_bus
-
-    def set_orchestrator(self, orchestrator: ThreadOrchestrator | None) -> None:
-        self._orchestrator = orchestrator
 
     async def close(self) -> None:
         return None
@@ -137,18 +139,15 @@ class DeepResearchChatKitServer(ChatKitServer[RequestContext]):
                 context,
             )
 
-        if self._orchestrator is None:
+        try:
+            state = await self._orchestrator.get_state(thread.id)
+        except TemporalUnavailableError:
             yield self._assistant_message_event(
                 thread=thread,
                 context=context,
-                text=(
-                    "The Temporal workflow service is currently unavailable. "
-                    "Please ensure Temporal and the research worker are running and try again."
-                ),
+                text=_TEMPORAL_UNAVAILABLE_MESSAGE,
             )
             return
-
-        state = await self._orchestrator.get_state(thread.id)
         if state.phase == ResearchPhase.AWAITING_CLARIFICATIONS:
             yield self._assistant_message_event(
                 thread=thread,
@@ -190,14 +189,22 @@ class DeepResearchChatKitServer(ChatKitServer[RequestContext]):
             icon="clock",
             text="Reading your request...",
         )
-        await self._orchestrator.send_message(
-            thread.id,
-            IncomingMessage(
-                message_id=message_id,
-                text=query,
-                already_persisted=True,
-            ),
-        )
+        try:
+            await self._orchestrator.send_message(
+                thread.id,
+                IncomingMessage(
+                    message_id=message_id,
+                    text=query,
+                    already_persisted=True,
+                ),
+            )
+        except TemporalUnavailableError:
+            yield self._assistant_message_event(
+                thread=thread,
+                context=context,
+                text=_TEMPORAL_UNAVAILABLE_MESSAGE,
+            )
+            return
         async for event in self._tail_thread_events(thread.id, after_seq=after_seq):
             yield event
 
@@ -239,6 +246,7 @@ class DeepResearchChatKitServer(ChatKitServer[RequestContext]):
             async for event in self._handle_followup_action(
                 thread=thread,
                 payload=payload,
+                context=context,
             ):
                 yield event
             return
@@ -257,9 +265,10 @@ class DeepResearchChatKitServer(ChatKitServer[RequestContext]):
     async def _handle_resume_action(
         self, thread: ThreadMetadata
     ) -> AsyncIterator[ThreadStreamEvent]:
-        if self._orchestrator is None:
+        try:
+            state = await self._orchestrator.get_state(thread.id)
+        except TemporalUnavailableError:
             return
-        state = await self._orchestrator.get_state(thread.id)
         if state.phase.is_terminal or state.phase in (
             ResearchPhase.AWAITING_CLARIFICATIONS,
             ResearchPhase.AWAITING_APPROVAL,
@@ -278,9 +287,6 @@ class DeepResearchChatKitServer(ChatKitServer[RequestContext]):
         payload: dict[str, Any],
         context: RequestContext,
     ) -> AsyncIterator[ThreadStreamEvent]:
-        if self._orchestrator is None:
-            return
-
         answers: dict[str, str] = {}
         if not skipped:
             raw_questions = payload.get("questions") or []
@@ -315,6 +321,11 @@ class DeepResearchChatKitServer(ChatKitServer[RequestContext]):
         after_seq = await self._event_bus.latest_seq(thread.id)
         try:
             await self._orchestrator.submit_clarifications(thread.id, submission)
+        except TemporalUnavailableError:
+            yield self._assistant_message_event(
+                thread=thread, context=context, text=_TEMPORAL_UNAVAILABLE_MESSAGE
+            )
+            return
         except WorkflowActionRejectedError as exc:
             yield self._assistant_message_event(
                 thread=thread, context=context, text=str(exc)
@@ -331,9 +342,6 @@ class DeepResearchChatKitServer(ChatKitServer[RequestContext]):
         payload: dict[str, Any],
         context: RequestContext,
     ) -> AsyncIterator[ThreadStreamEvent]:
-        if self._orchestrator is None:
-            return
-
         original_questions = [
             str(q) for q in (payload.get("sub_questions") or []) if str(q).strip()
         ]
@@ -368,6 +376,11 @@ class DeepResearchChatKitServer(ChatKitServer[RequestContext]):
         after_seq = await self._event_bus.latest_seq(thread.id)
         try:
             await self._orchestrator.submit_approval(thread.id, decision)
+        except TemporalUnavailableError:
+            yield self._assistant_message_event(
+                thread=thread, context=context, text=_TEMPORAL_UNAVAILABLE_MESSAGE
+            )
+            return
         except WorkflowActionRejectedError as exc:
             yield self._assistant_message_event(
                 thread=thread, context=context, text=str(exc)
@@ -381,9 +394,8 @@ class DeepResearchChatKitServer(ChatKitServer[RequestContext]):
         *,
         thread: ThreadMetadata,
         payload: dict[str, Any],
+        context: RequestContext,
     ) -> AsyncIterator[ThreadStreamEvent]:
-        if self._orchestrator is None:
-            return
         mode = str(payload.get("mode") or "executive_summary")
         base_query = str(payload.get("query") or thread.title or "this topic").strip()
         custom_prompt = str(payload.get("prompt") or "").strip()
@@ -396,18 +408,30 @@ class DeepResearchChatKitServer(ChatKitServer[RequestContext]):
             prompt = custom_prompt
         else:
             prompt = prompts.get(mode, f"Follow up on: {base_query}")
-        state = await self._orchestrator.get_state(thread.id)
+        try:
+            state = await self._orchestrator.get_state(thread.id)
+        except TemporalUnavailableError:
+            yield self._assistant_message_event(
+                thread=thread, context=context, text=_TEMPORAL_UNAVAILABLE_MESSAGE
+            )
+            return
         if not state.phase.is_terminal:
             return
         after_seq = await self._event_bus.latest_seq(thread.id)
-        await self._orchestrator.send_message(
-            thread.id,
-            IncomingMessage(
-                message_id=f"msg_{uuid.uuid4().hex[:12]}",
-                text=prompt,
-                already_persisted=False,
-            ),
-        )
+        try:
+            await self._orchestrator.send_message(
+                thread.id,
+                IncomingMessage(
+                    message_id=f"msg_{uuid.uuid4().hex[:12]}",
+                    text=prompt,
+                    already_persisted=False,
+                ),
+            )
+        except TemporalUnavailableError:
+            yield self._assistant_message_event(
+                thread=thread, context=context, text=_TEMPORAL_UNAVAILABLE_MESSAGE
+            )
+            return
         async for event in self._tail_thread_events(thread.id, after_seq=after_seq):
             yield event
 

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Protocol
 
-from temporalio.client import Client, WorkflowUpdateFailedError
+from temporalio.client import WorkflowUpdateFailedError
 from temporalio.service import RPCError, RPCStatusCode
 
 from app.domain import (
@@ -11,6 +11,7 @@ from app.domain import (
     IncomingMessage,
     ThreadWorkflowState,
 )
+from app.temporal.client import TemporalClientManager
 from app.temporal.workflows import AgentThreadInput, AgentThreadWorkflow
 
 
@@ -52,13 +53,13 @@ class TemporalThreadOrchestrator:
 
     def __init__(
         self,
-        client: Client,
+        client_manager: TemporalClientManager,
         task_queue: str,
         *,
         model: str = "gpt-4.1-mini",
         require_approval: bool = True,
     ) -> None:
-        self._client = client
+        self._client_manager = client_manager
         self._task_queue = task_queue
         self._model = model
         self._require_approval = require_approval
@@ -66,8 +67,9 @@ class TemporalThreadOrchestrator:
     async def send_message(
         self, thread_id: str, msg: IncomingMessage
     ) -> ThreadWorkflowState:
+        client = await self._client_manager.get_client()
         wf_id = thread_workflow_id(thread_id)
-        handle = await self._client.start_workflow(
+        handle = await client.start_workflow(
             AgentThreadWorkflow.run,
             AgentThreadInput(
                 thread_id=thread_id,
@@ -84,7 +86,8 @@ class TemporalThreadOrchestrator:
     async def submit_clarifications(
         self, thread_id: str, submission: ClarificationSubmission
     ) -> ThreadWorkflowState:
-        handle = self._client.get_workflow_handle(thread_workflow_id(thread_id))
+        client = await self._client_manager.get_client()
+        handle = client.get_workflow_handle(thread_workflow_id(thread_id))
         try:
             return await handle.execute_update(
                 AgentThreadWorkflow.submit_clarifications, submission
@@ -101,7 +104,8 @@ class TemporalThreadOrchestrator:
     async def submit_approval(
         self, thread_id: str, decision: ApprovalDecision
     ) -> ThreadWorkflowState:
-        handle = self._client.get_workflow_handle(thread_workflow_id(thread_id))
+        client = await self._client_manager.get_client()
+        handle = client.get_workflow_handle(thread_workflow_id(thread_id))
         try:
             return await handle.execute_update(
                 AgentThreadWorkflow.submit_approval, decision
@@ -116,7 +120,8 @@ class TemporalThreadOrchestrator:
             raise
 
     async def end_workflow(self, thread_id: str) -> None:
-        handle = self._client.get_workflow_handle(thread_workflow_id(thread_id))
+        client = await self._client_manager.get_client()
+        handle = client.get_workflow_handle(thread_workflow_id(thread_id))
         try:
             await handle.signal(AgentThreadWorkflow.end_workflow)
         except RPCError as exc:
@@ -125,7 +130,8 @@ class TemporalThreadOrchestrator:
             raise
 
     async def get_state(self, thread_id: str) -> ThreadWorkflowState:
-        handle = self._client.get_workflow_handle(thread_workflow_id(thread_id))
+        client = await self._client_manager.get_client()
+        handle = client.get_workflow_handle(thread_workflow_id(thread_id))
         try:
             return await handle.query(AgentThreadWorkflow.get_state)
         except RPCError as exc:

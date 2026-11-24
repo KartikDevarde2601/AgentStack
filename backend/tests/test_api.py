@@ -23,6 +23,7 @@ from app.domain import (
 from app.events import InMemoryThreadEventBus
 from app.main import create_app
 from app.temporal.activities import ThreadActivities
+from app.temporal.client import TemporalClientManager
 from app.temporal.orchestrator import TemporalThreadOrchestrator
 from app.temporal.workflows import AgentThreadWorkflow
 from tests.fake_agents_model import RoutingFakeModel
@@ -279,14 +280,16 @@ async def test_health_threads_crud_clarifications_approval_and_streaming() -> No
     plugin = OpenAIAgentsPlugin(model_provider=TestModelProvider(fake_model))
     async with await WorkflowEnvironment.start_time_skipping(plugins=[plugin]) as env:
         task_queue = f"test-api-{uuid.uuid4().hex[:8]}"
+        client_manager = TemporalClientManager.from_client(env.client)
         orchestrator = TemporalThreadOrchestrator(
-            env.client, task_queue=task_queue, require_approval=True
+            client_manager, task_queue=task_queue, require_approval=True
         )
         app = create_app(
             settings=Settings(openai_api_key="sk-test"),
             store=store,
             orchestrator=orchestrator,
             event_bus=bus,
+            temporal_client_manager=client_manager,
         )
 
         async with (
@@ -489,14 +492,16 @@ async def test_streaming_report_opens_and_closes_chatkit_content_part() -> None:
     plugin = OpenAIAgentsPlugin(model_provider=TestModelProvider(fake_model))
     async with await WorkflowEnvironment.start_time_skipping(plugins=[plugin]) as env:
         task_queue = f"test-stream-proto-{uuid.uuid4().hex[:8]}"
+        client_manager = TemporalClientManager.from_client(env.client)
         orchestrator = TemporalThreadOrchestrator(
-            env.client, task_queue=task_queue, require_approval=False
+            client_manager, task_queue=task_queue, require_approval=False
         )
         app = create_app(
             settings=Settings(openai_api_key="sk-test"),
             store=store,
             orchestrator=orchestrator,
             event_bus=bus,
+            temporal_client_manager=client_manager,
         )
 
         async with (

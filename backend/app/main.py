@@ -17,8 +17,8 @@ from app.config import Settings, get_settings
 from app.db.postgres_store import PostgresChatKitStore
 from app.domain import RequestContext
 from app.events import InMemoryThreadEventBus, PostgresThreadEventBus, ThreadEventBus
+from app.temporal.client import TemporalClientManager, TemporalUnavailableError
 from app.temporal.orchestrator import TemporalThreadOrchestrator, ThreadOrchestrator
-from app.temporal.worker import connect_temporal_client
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +32,7 @@ def create_app(
     store: Any = None,
     orchestrator: ThreadOrchestrator | None = None,
     event_bus: ThreadEventBus | None = None,
+    temporal_client_manager: TemporalClientManager | None = None,
 ) -> FastAPI:
     cfg = settings or get_settings()
 
@@ -41,7 +42,7 @@ def create_app(
         active_store = store
         active_orchestrator = orchestrator
         active_event_bus = event_bus
-        temporal_client = None
+        active_client_manager = temporal_client_manager
 
         if active_store is None:
             pool = AsyncConnectionPool(
@@ -67,15 +68,17 @@ def create_app(
                 active_event_bus = InMemoryThreadEventBus()
 
         if active_orchestrator is None:
+            if active_client_manager is None:
+                active_client_manager = TemporalClientManager(cfg)
             try:
-                temporal_client = await connect_temporal_client(cfg)
-                active_orchestrator = TemporalThreadOrchestrator(
-                    client=temporal_client,
-                    task_queue=cfg.temporal_task_queue,
-                    model=cfg.openai_model,
-                )
-            except Exception as exc:  # noqa: BLE001
+                await active_client_manager.get_client()
+            except TemporalUnavailableError as exc:
                 logger.warning("Temporal connection unavailable at startup: %s", exc)
+            active_orchestrator = TemporalThreadOrchestrator(
+                client_manager=active_client_manager,
+                task_queue=cfg.temporal_task_queue,
+                model=cfg.openai_model,
+            )
 
         chatkit_server = DeepResearchChatKitServer(
             store=active_store,
@@ -87,7 +90,7 @@ def create_app(
         app.state.pool = pool
         app.state.store = active_store
         app.state.event_bus = active_event_bus
-        app.state.temporal_client = temporal_client
+        app.state.temporal_client_manager = active_client_manager
         app.state.orchestrator = active_orchestrator
         app.state.chatkit_server = chatkit_server
 
@@ -95,6 +98,8 @@ def create_app(
             yield
         finally:
             await chatkit_server.close()
+            if active_client_manager is not None:
+                await active_client_manager.close()
             if pool is not None:
                 await pool.close()
 
@@ -110,27 +115,8 @@ def create_app(
         allow_private_network=True,
     )
 
-    async def _ensure_orchestrator(request: Request) -> ThreadOrchestrator | None:
-        if request.app.state.orchestrator is not None:
-            return request.app.state.orchestrator
-        try:
-            client = await connect_temporal_client(request.app.state.settings)
-            orch = TemporalThreadOrchestrator(
-                client=client,
-                task_queue=request.app.state.settings.temporal_task_queue,
-                model=request.app.state.settings.openai_model,
-            )
-            request.app.state.temporal_client = client
-            request.app.state.orchestrator = orch
-            request.app.state.chatkit_server.set_orchestrator(orch)
-            return orch
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Lazy Temporal reconnect failed: %s", exc)
-            return None
-
     @app.post("/chatkit")
     async def chatkit_endpoint(request: Request) -> Response:
-        await _ensure_orchestrator(request)
         payload = await request.body()
         context = RequestContext()
         result = await request.app.state.chatkit_server.process(payload, context)
@@ -176,20 +162,21 @@ def create_app(
 
     @app.get("/api/threads/{thread_id}/state")
     async def get_thread_state(thread_id: str, request: Request) -> dict[str, Any]:
-        orch = await _ensure_orchestrator(request)
-        if orch is None:
+        try:
+            state = await request.app.state.orchestrator.get_state(thread_id)
+        except TemporalUnavailableError as exc:
             raise HTTPException(
                 status_code=503, detail="Temporal orchestrator unavailable"
-            )
-        state = await orch.get_state(thread_id)
+            ) from exc
         return state.model_dump(mode="json")
 
     @app.get("/health")
     async def health(request: Request) -> dict[str, Any]:
         postgres_ok = await request.app.state.store.ping()
-        temporal_ok = request.app.state.orchestrator is not None
-        if not temporal_ok:
-            await _ensure_orchestrator(request)
+        manager = request.app.state.temporal_client_manager
+        if manager is not None:
+            temporal_ok = await manager.ping()
+        else:
             temporal_ok = request.app.state.orchestrator is not None
         return {
             "status": "ok",

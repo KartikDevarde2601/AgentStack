@@ -22,6 +22,7 @@ from app.domain import (
 )
 from app.events import InMemoryThreadEventBus, ThreadEventKind
 from app.temporal.activities import ThreadActivities
+from app.temporal.client import TemporalClientManager
 from app.temporal.orchestrator import (
     TemporalThreadOrchestrator,
     WorkflowActionRejectedError,
@@ -146,7 +147,9 @@ async def test_direct_answer_skips_research_and_keeps_same_thread() -> None:
     async with await WorkflowEnvironment.start_time_skipping(plugins=[plugin]) as env:
         task_queue = f"test-direct-{uuid.uuid4().hex[:8]}"
         orchestrator = TemporalThreadOrchestrator(
-            env.client, task_queue=task_queue, require_approval=True
+            TemporalClientManager.from_client(env.client),
+            task_queue=task_queue,
+            require_approval=True,
         )
         async with Worker(
             env.client,
@@ -208,7 +211,9 @@ async def test_two_stage_hitl_clarifications_then_plan_approval_and_web_search()
     async with await WorkflowEnvironment.start_time_skipping(plugins=[plugin]) as env:
         task_queue = f"test-two-stage-{uuid.uuid4().hex[:8]}"
         orchestrator = TemporalThreadOrchestrator(
-            env.client, task_queue=task_queue, require_approval=True
+            TemporalClientManager.from_client(env.client),
+            task_queue=task_queue,
+            require_approval=True,
         )
         async with Worker(
             env.client,
@@ -382,7 +387,9 @@ async def test_retry_after_failed_turn_preserves_original_topic() -> None:
     async with await WorkflowEnvironment.start_time_skipping(plugins=[plugin]) as env:
         task_queue = f"test-retry-{uuid.uuid4().hex[:8]}"
         orchestrator = TemporalThreadOrchestrator(
-            env.client, task_queue=task_queue, require_approval=True
+            TemporalClientManager.from_client(env.client),
+            task_queue=task_queue,
+            require_approval=True,
         )
         async with Worker(
             env.client,
@@ -438,7 +445,9 @@ async def test_update_validators_reject_stale_actions_and_end_workflow_exits_cle
     async with await WorkflowEnvironment.start_time_skipping(plugins=[plugin]) as env:
         task_queue = f"test-validators-{uuid.uuid4().hex[:8]}"
         orchestrator = TemporalThreadOrchestrator(
-            env.client, task_queue=task_queue, require_approval=True
+            TemporalClientManager.from_client(env.client),
+            task_queue=task_queue,
+            require_approval=True,
         )
         async with Worker(
             env.client,

@@ -2,14 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import timedelta
 from typing import Any
 
 from agents.models.openai_provider import OpenAIProvider
 from psycopg_pool import AsyncConnectionPool
-from temporalio.client import Client
-from temporalio.common import RetryPolicy
-from temporalio.contrib.openai_agents import ModelActivityParameters, OpenAIAgentsPlugin
 from temporalio.worker import Worker
 
 from app.config import Settings, get_settings
@@ -17,37 +13,10 @@ from app.db.postgres_store import PostgresChatKitStore
 from app.events import PostgresThreadEventBus
 from app.research.openai_client import OpenAIResearchClient
 from app.temporal.activities import ThreadActivities
+from app.temporal.client import TemporalClientManager
 from app.temporal.workflows import AgentThreadWorkflow
 
 logger = logging.getLogger(__name__)
-
-
-def build_openai_agents_plugin(
-    *, model_provider: Any | None = None
-) -> OpenAIAgentsPlugin:
-    return OpenAIAgentsPlugin(
-        model_params=ModelActivityParameters(
-            start_to_close_timeout=timedelta(seconds=180),
-            schedule_to_close_timeout=timedelta(seconds=420),
-            retry_policy=RetryPolicy(
-                backoff_coefficient=2.0,
-                initial_interval=timedelta(seconds=1),
-                maximum_interval=timedelta(seconds=10),
-                maximum_attempts=3,
-            ),
-        ),
-        model_provider=model_provider,
-    )
-
-
-async def connect_temporal_client(
-    settings: Settings, *, model_provider: Any | None = None
-) -> Client:
-    return await Client.connect(
-        settings.temporal_address,
-        namespace=settings.temporal_namespace,
-        plugins=[build_openai_agents_plugin(model_provider=model_provider)],
-    )
 
 
 async def run_worker(settings: Settings | None = None) -> None:
@@ -73,13 +42,14 @@ async def run_worker(settings: Settings | None = None) -> None:
         timeout=5.0,
     )
     await pool.open(wait=True, timeout=5.0)
+    client_manager = TemporalClientManager(
+        cfg, model_provider=OpenAIProvider(api_key=api_key)
+    )
     try:
         store = PostgresChatKitStore(pool)
         await store.initialize()
         event_bus = PostgresThreadEventBus(pool=pool, dsn=cfg.database_url)
-        client = await connect_temporal_client(
-            cfg, model_provider=OpenAIProvider(api_key=api_key)
-        )
+        client = await client_manager.get_client()
         research_client = OpenAIResearchClient(
             api_key=api_key,
             model=cfg.openai_model,
@@ -110,6 +80,7 @@ async def run_worker(settings: Settings | None = None) -> None:
         logger.info("Temporal worker started on queue %s", cfg.temporal_task_queue)
         await worker.run()
     finally:
+        await client_manager.close()
         await pool.close()
 
 
