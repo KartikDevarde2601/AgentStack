@@ -2,30 +2,34 @@ from __future__ import annotations
 
 import asyncio
 import uuid
-from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 
 import pytest
 from chatkit.types import AssistantMessageItem, ThreadItem
-from temporalio.contrib.pydantic import pydantic_data_converter
+from temporalio.common import RetryPolicy
+from temporalio.contrib.openai_agents import ModelActivityParameters, OpenAIAgentsPlugin
+from temporalio.contrib.openai_agents.testing import TestModelProvider
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
 
 from app.domain import (
     ApprovalDecision,
-    ConversationReply,
+    ClarificationSubmission,
     IncomingMessage,
     RequestContext,
-    ResearchFinding,
     ResearchPhase,
-    ResearchPlan,
     ResearchRunRecord,
-    TurnResponse,
 )
 from app.events import InMemoryThreadEventBus, ThreadEventKind
 from app.temporal.activities import ThreadActivities
-from app.temporal.orchestrator import TemporalThreadOrchestrator, thread_workflow_id
+from app.temporal.client import TemporalClientManager
+from app.temporal.orchestrator import (
+    TemporalThreadOrchestrator,
+    WorkflowActionRejectedError,
+    thread_workflow_id,
+)
 from app.temporal.workflows import AgentThreadInput, AgentThreadWorkflow
+from tests.fake_agents_model import RoutingFakeModel
 
 
 class FakeThreadStore:
@@ -82,66 +86,35 @@ class FakeThreadStore:
         return record
 
 
-class FakeResearchLLMClient:
-    def __init__(self) -> None:
+class FakeConversationClient:
+    def __init__(
+        self,
+        *,
+        conversation_history: dict[str, list[str]] | None = None,
+        fail_first_n_flushes: int = 0,
+    ) -> None:
         self.created_conversations: list[str] = []
-        self.investigated: list[tuple[str, str, str]] = []
+        self.conversation_history = (
+            conversation_history if conversation_history is not None else {}
+        )
+        self._remaining_flush_failures = fail_first_n_flushes
 
     async def create_conversation(self) -> str:
         conv_id = f"conv_{uuid.uuid4().hex[:8]}"
         self.created_conversations.append(conv_id)
+        self.conversation_history.setdefault(conv_id, [])
         return conv_id
 
     async def append_conversation_messages(
         self, conversation_id: str, messages: list[dict[str, str]]
     ) -> None:
-        return None
-
-    async def generate_research_plan(
-        self, query: str, *, conversation_id: str | None = None
-    ) -> ResearchPlan:
-        return ResearchPlan(
-            query=query,
-            sub_questions=[
-                f"Sub-question 1 for {query}",
-                f"Sub-question 2 for {query}",
-            ],
-        )
-
-    async def resolve_turn(
-        self, query: str, *, conversation_id: str | None = None
-    ) -> TurnResponse:
-        return await self.generate_research_plan(query, conversation_id=conversation_id)
-
-    async def investigate_sub_question(
-        self,
-        query: str,
-        sub_question: str,
-        *,
-        depth: str = "standard",
-        conversation_id: str | None = None,
-    ) -> ResearchFinding:
-        self.investigated.append((query, sub_question, depth))
-        return ResearchFinding(
-            sub_question=sub_question,
-            summary=f"Summary of {sub_question}",
-            key_points=[f"Point A ({depth})"],
-            sources=["https://example.com/source"],
-        )
-
-    async def synthesize_report_stream(
-        self,
-        query: str,
-        findings: list[ResearchFinding],
-        *,
-        conversation_id: str | None = None,
-        on_delta: Callable[[str], Awaitable[None]] | None = None,
-    ) -> str:
-        parts = [f"# Report: {query}\n\n", f"Synthesized {len(findings)} findings."]
-        for chunk in parts:
-            if on_delta is not None:
-                await on_delta(chunk)
-        return "".join(parts)
+        if self._remaining_flush_failures > 0:
+            self._remaining_flush_failures -= 1
+            raise RuntimeError("503 Service Unavailable")
+        for msg in messages:
+            self.conversation_history.setdefault(conversation_id, []).append(
+                msg["content"]
+            )
 
 
 def _all_activities(activities: ThreadActivities) -> list:
@@ -150,11 +123,9 @@ def _all_activities(activities: ThreadActivities) -> list:
         activities.record_failed_turns_activity,
         activities.persist_user_message_activity,
         activities.publish_progress_activity,
+        activities.persist_clarifications_widget_activity,
         activities.persist_approval_widget_activity,
-        activities.plan_research_activity,
-        activities.resolve_turn_activity,
-        activities.investigate_sub_question_activity,
-        activities.synthesize_report_activity,
+        activities.publish_report_activity,
         activities.persist_final_item_activity,
         activities.publish_turn_end_activity,
         activities.prune_thread_events_activity,
@@ -162,32 +133,23 @@ def _all_activities(activities: ThreadActivities) -> list:
 
 
 @pytest.mark.asyncio
-async def test_conversation_replies_skip_research_and_keep_the_same_thread() -> None:
-    class ConversationLLM(FakeResearchLLMClient):
-        async def resolve_turn(
-            self, query: str, *, conversation_id: str | None = None
-        ) -> TurnResponse:
-            assert self.created_conversations == [conversation_id]
-            if query == "What does WAL stand for?":
-                return ConversationReply(kind="answer", text="Write-ahead logging.")
-            if query == "Can you go further?":
-                return ConversationReply(
-                    kind="clarify", text="Would you like an explanation or deep research?"
-                )
-            return await super().resolve_turn(query, conversation_id=conversation_id)
-
+async def test_direct_answer_skips_research_and_keeps_same_thread() -> None:
     store = FakeThreadStore()
     bus = InMemoryThreadEventBus()
-    llm = ConversationLLM()
-    activities = ThreadActivities(client=llm, store=store, event_bus=bus)
-    thread_id = "thr_conversation_replies"
+    conv_client = FakeConversationClient()
+    fake_model = RoutingFakeModel(
+        direct_answers={"What does WAL stand for?": "Write-ahead logging."}
+    )
+    activities = ThreadActivities(client=conv_client, store=store, event_bus=bus)
+    thread_id = "thr_direct_answer"
 
-    async with await WorkflowEnvironment.start_time_skipping(
-        data_converter=pydantic_data_converter
-    ) as env:
-        task_queue = f"test-conversation-{uuid.uuid4().hex[:8]}"
+    plugin = OpenAIAgentsPlugin(model_provider=TestModelProvider(fake_model))
+    async with await WorkflowEnvironment.start_time_skipping(plugins=[plugin]) as env:
+        task_queue = f"test-direct-{uuid.uuid4().hex[:8]}"
         orchestrator = TemporalThreadOrchestrator(
-            env.client, task_queue=task_queue, require_approval=True
+            TemporalClientManager.from_client(env.client),
+            task_queue=task_queue,
+            require_approval=True,
         )
         async with Worker(
             env.client,
@@ -195,63 +157,63 @@ async def test_conversation_replies_skip_research_and_keep_the_same_thread() -> 
             workflows=[AgentThreadWorkflow],
             activities=_all_activities(activities),
         ):
-            for turn, (query, expected) in enumerate(
-                [
-                    ("What does WAL stand for?", "Write-ahead logging."),
-                    (
-                        "Can you go further?",
-                        "Would you like an explanation or deep research?",
-                    ),
-                ],
-                start=1,
-            ):
-                after_seq = await bus.latest_seq(thread_id)
-                await orchestrator.send_message(
-                    thread_id, IncomingMessage(message_id=f"msg_{turn}", text=query)
-                )
-                kinds = []
-                async with asyncio.timeout(5):
-                    async for event in bus.subscribe(thread_id, after_seq=after_seq):
-                        kinds.append(event.kind)
-                        if event.kind == ThreadEventKind.TURN_END:
-                            break
-                assert ThreadEventKind.APPROVAL_PAUSE not in kinds
-                assert ThreadEventKind.PROGRESS not in kinds
-                reply = store.items[thread_id][-1]
-                assert isinstance(reply, AssistantMessageItem)
-                assert reply.content[0].text == expected
-                async with asyncio.timeout(5):
-                    state = await orchestrator.get_state(thread_id)
-                    while state.phase != ResearchPhase.IDLE:
-                        await asyncio.sleep(0.02)
-                        state = await orchestrator.get_state(thread_id)
-
-            assert not store.runs
+            after_seq = await bus.latest_seq(thread_id)
             await orchestrator.send_message(
                 thread_id,
-                IncomingMessage(message_id="msg_3", text="Deep research on WAL, please"),
+                IncomingMessage(message_id="msg_1", text="What does WAL stand for?"),
+            )
+            kinds = []
+            async with asyncio.timeout(5):
+                async for event in bus.subscribe(thread_id, after_seq=after_seq):
+                    kinds.append(event.kind)
+                    if event.kind == ThreadEventKind.TURN_END:
+                        break
+
+            assert ThreadEventKind.APPROVAL_PAUSE not in kinds
+            assert ThreadEventKind.PROGRESS not in kinds
+            reply = store.items[thread_id][-1]
+            assert isinstance(reply, AssistantMessageItem)
+            assert reply.content[0].text == "Write-ahead logging."
+            assert not store.runs
+
+            async with asyncio.timeout(5):
+                state = await orchestrator.get_state(thread_id)
+                while state.phase != ResearchPhase.IDLE:
+                    await asyncio.sleep(0.02)
+                    state = await orchestrator.get_state(thread_id)
+
+            # Follow-up specific research query enters the research pipeline on the same thread.
+            await orchestrator.send_message(
+                thread_id,
+                IncomingMessage(
+                    message_id="msg_2", text="Compare Postgres and SQLite WAL internals"
+                ),
             )
             async with asyncio.timeout(5):
                 state = await orchestrator.get_state(thread_id)
                 while state.phase != ResearchPhase.AWAITING_APPROVAL:
                     await asyncio.sleep(0.02)
                     state = await orchestrator.get_state(thread_id)
-            assert not llm.investigated
+
+            assert state.pending_approval is not None
+            assert not fake_model.searched_queries
 
 
 @pytest.mark.asyncio
-async def test_agent_thread_workflow_approval_and_streaming() -> None:
+async def test_two_stage_hitl_clarifications_then_plan_approval_and_web_search() -> None:
     store = FakeThreadStore()
     bus = InMemoryThreadEventBus()
-    llm = FakeResearchLLMClient()
-    activities = ThreadActivities(client=llm, store=store, event_bus=bus)
+    conv_client = FakeConversationClient()
+    fake_model = RoutingFakeModel(clarify_keywords=("best",))
+    activities = ThreadActivities(client=conv_client, store=store, event_bus=bus)
 
-    async with await WorkflowEnvironment.start_time_skipping(
-        data_converter=pydantic_data_converter
-    ) as env:
-        task_queue = f"test-entity-{uuid.uuid4().hex[:8]}"
+    plugin = OpenAIAgentsPlugin(model_provider=TestModelProvider(fake_model))
+    async with await WorkflowEnvironment.start_time_skipping(plugins=[plugin]) as env:
+        task_queue = f"test-two-stage-{uuid.uuid4().hex[:8]}"
         orchestrator = TemporalThreadOrchestrator(
-            env.client, task_queue=task_queue, require_approval=True
+            TemporalClientManager.from_client(env.client),
+            task_queue=task_queue,
+            require_approval=True,
         )
         async with Worker(
             env.client,
@@ -264,68 +226,93 @@ async def test_agent_thread_workflow_approval_and_streaming() -> None:
                 thread_id,
                 IncomingMessage(
                     message_id="msg_1",
-                    text="Compare Postgres and SQLite",
+                    text="Best databases for AI agents",
                     already_persisted=True,
                 ),
             )
 
-            # Wait until Turn 1 pauses at the Approval Gate.
-            state = await orchestrator.get_state(thread_id)
-            for _ in range(100):
-                if state.phase == ResearchPhase.AWAITING_APPROVAL:
-                    break
-                await asyncio.sleep(0.02)
+            # Stage 1: Wait for dynamic Clarifying Questions Gate
+            async with asyncio.timeout(5):
                 state = await orchestrator.get_state(thread_id)
+                while state.phase != ResearchPhase.AWAITING_CLARIFICATIONS:
+                    await asyncio.sleep(0.02)
+                    state = await orchestrator.get_state(thread_id)
 
-            assert state.phase == ResearchPhase.AWAITING_APPROVAL
+            assert state.pending_clarification is not None
+            assert len(state.pending_clarification.questions) == 3
+            assert [q.kind for q in state.pending_clarification.questions] == [
+                "single_select",
+                "multi_select",
+                "long_text",
+            ]
+
+            # Submit dynamic clarification answers
+            await orchestrator.submit_clarifications(
+                thread_id,
+                ClarificationSubmission(
+                    skipped=False,
+                    answers={
+                        "q_0": "production",
+                        "q_1": "Latency, Operations",
+                        "q_2": "High-concurrency multi-tenant SaaS",
+                    },
+                ),
+            )
+
+            # Stage 2: InstructionAgent enhances prompt -> PlannerAgent -> Plan Approval Gate
+            async with asyncio.timeout(5):
+                state = await orchestrator.get_state(thread_id)
+                while state.phase != ResearchPhase.AWAITING_APPROVAL:
+                    await asyncio.sleep(0.02)
+                    state = await orchestrator.get_state(thread_id)
+
             assert state.pending_approval is not None
-            assert state.openai_conversation_id is not None
+            assert len(fake_model.enhanced_prompts) == 1
+            assert "High-concurrency multi-tenant SaaS" in fake_model.enhanced_prompts[0]
 
-            # Approve Turn 1 with edited sub-questions + extra focus.
+            # Approve plan with edited queries + extra focus + deep depth
             await orchestrator.submit_approval(
                 thread_id,
                 ApprovalDecision(
                     approved=True,
                     sub_questions=state.pending_approval.sub_questions[:1],
                     depth="deep",
-                    extra_focus="WAL mode tradeoffs",
+                    extra_focus="Postgres LISTEN/NOTIFY scaling",
                 ),
             )
 
-            # Wait for Turn 1 to finish and workflow to return to IDLE.
-            for _ in range(100):
+            # Wait for parallel web searches & report synthesis to finish
+            async with asyncio.timeout(5):
                 state = await orchestrator.get_state(thread_id)
-                if state.phase == ResearchPhase.IDLE:
-                    break
-                await asyncio.sleep(0.02)
+                while state.phase != ResearchPhase.IDLE:
+                    await asyncio.sleep(0.02)
+                    state = await orchestrator.get_state(thread_id)
 
-            assert state.phase == ResearchPhase.IDLE
             assert state.turns_since_continue == 1
+            assert "Postgres LISTEN/NOTIFY scaling" in fake_model.searched_queries
 
-            # Verify live streaming deltas were emitted to ThreadEventBus.
-            events = [ev for ev in bus._events_by_thread[thread_id]]
+            events = list(bus._events_by_thread[thread_id])
             assert any(ev.kind == ThreadEventKind.APPROVAL_PAUSE for ev in events)
             assert any(ev.kind == ThreadEventKind.TEXT_DELTA for ev in events)
             assert any(ev.kind == ThreadEventKind.TURN_END for ev in events)
 
-            # Verify findings and final report were persisted by activities.
-            items = store.items[thread_id]
-            assistant_items = [i for i in items if isinstance(i, AssistantMessageItem)]
+            assistant_items = [
+                i for i in store.items[thread_id] if isinstance(i, AssistantMessageItem)
+            ]
             assert len(assistant_items) == 1
-            assert "# Report: Compare Postgres and SQLite" in assistant_items[0].content[0].text
-            assert any(sub == "WAL mode tradeoffs" for _, sub, _ in llm.investigated)
+            assert "# Deep Research Report:" in assistant_items[0].content[0].text
 
 
 @pytest.mark.asyncio
-async def test_agent_thread_workflow_reject_and_idle_prune() -> None:
+async def test_reject_plan_and_idle_prune() -> None:
     store = FakeThreadStore()
     bus = InMemoryThreadEventBus()
-    llm = FakeResearchLLMClient()
-    activities = ThreadActivities(client=llm, store=store, event_bus=bus)
+    conv_client = FakeConversationClient()
+    fake_model = RoutingFakeModel()
+    activities = ThreadActivities(client=conv_client, store=store, event_bus=bus)
 
-    async with await WorkflowEnvironment.start_time_skipping(
-        data_converter=pydantic_data_converter
-    ) as env:
+    plugin = OpenAIAgentsPlugin(model_provider=TestModelProvider(fake_model))
+    async with await WorkflowEnvironment.start_time_skipping(plugins=[plugin]) as env:
         task_queue = f"test-idle-{uuid.uuid4().hex[:8]}"
         async with Worker(
             env.client,
@@ -348,31 +335,28 @@ async def test_agent_thread_workflow_reject_and_idle_prune() -> None:
                 start_signal_args=[
                     IncomingMessage(
                         message_id="msg_1",
-                        text="Turn 1",
+                        text="Compare Temporal and Celery",
                         already_persisted=True,
                     )
                 ],
             )
 
-            for _ in range(100):
+            async with asyncio.timeout(5):
                 state = await handle.query(AgentThreadWorkflow.get_state)
-                if state.phase == ResearchPhase.AWAITING_APPROVAL:
-                    break
-                await asyncio.sleep(0.02)
-            assert state.phase == ResearchPhase.AWAITING_APPROVAL
+                while state.phase != ResearchPhase.AWAITING_APPROVAL:
+                    await asyncio.sleep(0.02)
+                    state = await handle.query(AgentThreadWorkflow.get_state)
 
-            await handle.signal(
+            await handle.execute_update(
                 AgentThreadWorkflow.submit_approval,
                 ApprovalDecision(approved=False, reason="Cancelled by user"),
             )
 
-            # Workflow returns to IDLE and exits after 30m (time-skipped), pruning run_events.
             await handle.result()
 
-            items = store.items[thread_id]
             cancelled_items = [
                 i
-                for i in items
+                for i in store.items[thread_id]
                 if isinstance(i, AssistantMessageItem)
                 and "Research Cancelled" in i.content[0].text
             ]
@@ -381,68 +365,31 @@ async def test_agent_thread_workflow_reject_and_idle_prune() -> None:
 
 
 @pytest.mark.asyncio
-async def test_retry_after_failed_turn_preserves_original_topic_in_conversation() -> None:
-    """Regression test: OpenAI responses.create(conversation=...) is transactional,
-    so a failed Turn 1 never appends the user's prompt to the Conversation.
-    AgentThreadWorkflow must record/flush failed Turns so 'try again' resolves the original topic.
-    """
-
-    class TransactionalConversationLLM(FakeResearchLLMClient):
-        def __init__(self) -> None:
-            super().__init__()
-            self.conversation_history: dict[str, list[str]] = {}
-            self._remaining_plan_failures = 3  # exhausts maximum_attempts=3
-            self._remaining_flush_failures = 1  # fails best-effort flush during Turn 1 outage
-
-        async def create_conversation(self) -> str:
-            cid = await super().create_conversation()
-            self.conversation_history[cid] = []
-            return cid
-
-        async def append_conversation_messages(
-            self, conversation_id: str, messages: list[dict[str, str]]
-        ) -> None:
-            if self._remaining_flush_failures > 0:
-                self._remaining_flush_failures -= 1
-                raise RuntimeError("503 Service Unavailable")
-            for msg in messages:
-                self.conversation_history.setdefault(conversation_id, []).append(
-                    msg["content"]
-                )
-
-        async def generate_research_plan(
-            self, query: str, *, conversation_id: str | None = None
-        ) -> ResearchPlan:
-            if self._remaining_plan_failures > 0:
-                self._remaining_plan_failures -= 1
-                raise RuntimeError("400 Bad Request")
-
-            history = self.conversation_history.get(conversation_id or "", [])
-            combined = " ".join(history + [query]).lower()
-            if "temporal" not in combined:
-                return ResearchPlan(
-                    query=query,
-                    sub_questions=["What topic or question should the research address?"],
-                )
-            return ResearchPlan(
-                query="Temporal durable execution for deep research agents",
-                sub_questions=[
-                    "How does Temporal event sourcing recover agent state?",
-                    "How do Temporal signals enable HITL approval gates?",
-                ],
-            )
-
+async def test_retry_after_failed_turn_preserves_original_topic() -> None:
+    shared_history: dict[str, list[str]] = {}
     store = FakeThreadStore()
     bus = InMemoryThreadEventBus()
-    llm = TransactionalConversationLLM()
-    activities = ThreadActivities(client=llm, store=store, event_bus=bus)
+    conv_client = FakeConversationClient(
+        conversation_history=shared_history, fail_first_n_flushes=1
+    )
+    fake_model = RoutingFakeModel(
+        fail_first_n_triage=1,
+        conversation_history=shared_history,
+    )
+    activities = ThreadActivities(client=conv_client, store=store, event_bus=bus)
 
-    async with await WorkflowEnvironment.start_time_skipping(
-        data_converter=pydantic_data_converter
-    ) as env:
+    plugin = OpenAIAgentsPlugin(
+        model_params=ModelActivityParameters(
+            retry_policy=RetryPolicy(maximum_attempts=1)
+        ),
+        model_provider=TestModelProvider(fake_model),
+    )
+    async with await WorkflowEnvironment.start_time_skipping(plugins=[plugin]) as env:
         task_queue = f"test-retry-{uuid.uuid4().hex[:8]}"
         orchestrator = TemporalThreadOrchestrator(
-            env.client, task_queue=task_queue, require_approval=True
+            TemporalClientManager.from_client(env.client),
+            task_queue=task_queue,
+            require_approval=True,
         )
         async with Worker(
             env.client,
@@ -452,23 +399,20 @@ async def test_retry_after_failed_turn_preserves_original_topic_in_conversation(
         ):
             thread_id = f"thr_{uuid.uuid4().hex[:8]}"
 
-            # Turn 1 fails completely (including best-effort flush during outage).
             await orchestrator.send_message(
                 thread_id,
                 IncomingMessage(
                     message_id="msg_1",
-                    text="Explain how Temporal durable execution improves reliability for multi-step deep research agents.",
+                    text="Explain how Temporal durable execution improves reliability.",
                     already_persisted=True,
                 ),
             )
-            for _ in range(250):
+            async with asyncio.timeout(5):
                 st = await orchestrator.get_state(thread_id)
-                if st.phase == ResearchPhase.IDLE and st.turns_since_continue == 1:
-                    break
-                await asyncio.sleep(0.02)
-            assert st.turns_since_continue == 1
+                while not (st.phase == ResearchPhase.IDLE and st.turns_since_continue == 1):
+                    await asyncio.sleep(0.02)
+                    st = await orchestrator.get_state(thread_id)
 
-            # Turn 2 ("try again") flushes Turn 1 into the OpenAI Conversation first.
             await orchestrator.send_message(
                 thread_id,
                 IncomingMessage(
@@ -477,15 +421,85 @@ async def test_retry_after_failed_turn_preserves_original_topic_in_conversation(
                     already_persisted=True,
                 ),
             )
-            for _ in range(100):
+            async with asyncio.timeout(5):
                 st = await orchestrator.get_state(thread_id)
-                if st.phase == ResearchPhase.AWAITING_APPROVAL:
-                    break
-                await asyncio.sleep(0.02)
+                while st.phase != ResearchPhase.AWAITING_APPROVAL:
+                    await asyncio.sleep(0.02)
+                    st = await orchestrator.get_state(thread_id)
 
-            assert st.phase == ResearchPhase.AWAITING_APPROVAL
             assert st.pending_approval is not None
             assert any(
                 "temporal" in q.lower() for q in st.pending_approval.sub_questions
             )
 
+
+@pytest.mark.asyncio
+async def test_update_validators_reject_stale_actions_and_end_workflow_exits_cleanly() -> None:
+    store = FakeThreadStore()
+    bus = InMemoryThreadEventBus()
+    conv_client = FakeConversationClient()
+    fake_model = RoutingFakeModel(clarify_keywords=("best",))
+    activities = ThreadActivities(client=conv_client, store=store, event_bus=bus)
+
+    plugin = OpenAIAgentsPlugin(model_provider=TestModelProvider(fake_model))
+    async with await WorkflowEnvironment.start_time_skipping(plugins=[plugin]) as env:
+        task_queue = f"test-validators-{uuid.uuid4().hex[:8]}"
+        orchestrator = TemporalThreadOrchestrator(
+            TemporalClientManager.from_client(env.client),
+            task_queue=task_queue,
+            require_approval=True,
+        )
+        async with Worker(
+            env.client,
+            task_queue=task_queue,
+            workflows=[AgentThreadWorkflow],
+            activities=_all_activities(activities),
+        ):
+            thread_id = f"thr_{uuid.uuid4().hex[:8]}"
+            await orchestrator.send_message(
+                thread_id,
+                IncomingMessage(
+                    message_id="msg_1",
+                    text="Best vector databases",
+                    already_persisted=True,
+                ),
+            )
+            async with asyncio.timeout(5):
+                state = await orchestrator.get_state(thread_id)
+                while state.phase != ResearchPhase.AWAITING_CLARIFICATIONS:
+                    await asyncio.sleep(0.02)
+                    state = await orchestrator.get_state(thread_id)
+
+            # Wrong phase: submit_approval while awaiting clarifications must be rejected.
+            with pytest.raises(WorkflowActionRejectedError, match="not currently awaiting plan approval"):
+                await orchestrator.submit_approval(
+                    thread_id, ApprovalDecision(approved=True)
+                )
+
+            # Stale turn_id on clarifications must be rejected.
+            with pytest.raises(WorkflowActionRejectedError, match="earlier turn"):
+                await orchestrator.submit_clarifications(
+                    thread_id,
+                    ClarificationSubmission(
+                        turn_id="turn_stale_999",
+                        skipped=False,
+                        answers={"q_0": "production"},
+                    ),
+                )
+
+            # Empty non-skipped answers must be rejected.
+            with pytest.raises(WorkflowActionRejectedError, match="at least one clarification"):
+                await orchestrator.submit_clarifications(
+                    thread_id,
+                    ClarificationSubmission(
+                        turn_id=state.active_turn_id,
+                        skipped=False,
+                        answers={},
+                    ),
+                )
+
+            # Fire-and-forget end_workflow signal cleanly exits parked workflow & prunes events.
+            await orchestrator.end_workflow(thread_id)
+            handle = env.client.get_workflow_handle(thread_workflow_id(thread_id))
+            await handle.result()
+            assert await bus.latest_seq(thread_id) == 0

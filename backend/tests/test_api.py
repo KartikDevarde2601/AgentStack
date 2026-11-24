@@ -1,34 +1,32 @@
 from __future__ import annotations
 
-import asyncio
 import json
 import uuid
-from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 
 import httpx
 import pytest
 from chatkit.store import NotFoundError, Store
 from chatkit.types import Attachment, Page, ThreadItem, ThreadMetadata
-from temporalio.contrib.pydantic import pydantic_data_converter
+from temporalio.contrib.openai_agents import OpenAIAgentsPlugin
+from temporalio.contrib.openai_agents.testing import TestModelProvider
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
 
 from app.config import Settings
 from app.domain import (
     RequestContext,
-    ResearchFinding,
     ResearchPhase,
-    ResearchPlan,
     ResearchRunRecord,
     ThreadSummary,
-    TurnResponse,
 )
 from app.events import InMemoryThreadEventBus
 from app.main import create_app
 from app.temporal.activities import ThreadActivities
+from app.temporal.client import TemporalClientManager
 from app.temporal.orchestrator import TemporalThreadOrchestrator
 from app.temporal.workflows import AgentThreadWorkflow
+from tests.fake_agents_model import RoutingFakeModel
 
 
 class InMemoryChatKitStore(Store[RequestContext]):
@@ -238,7 +236,7 @@ class InMemoryChatKitStore(Store[RequestContext]):
         return runs
 
 
-class FakeLLM:
+class FakeConversationClient:
     async def create_conversation(self) -> str:
         return f"conv_{uuid.uuid4().hex[:8]}"
 
@@ -246,48 +244,6 @@ class FakeLLM:
         self, conversation_id: str, messages: list[dict[str, str]]
     ) -> None:
         return None
-
-    async def generate_research_plan(
-        self, query: str, *, conversation_id: str | None = None
-    ) -> ResearchPlan:
-        return ResearchPlan(
-            query=query,
-            sub_questions=[f"Architecture of {query}", f"Tradeoffs of {query}"],
-        )
-
-    async def resolve_turn(
-        self, query: str, *, conversation_id: str | None = None
-    ) -> TurnResponse:
-        return await self.generate_research_plan(query, conversation_id=conversation_id)
-
-    async def investigate_sub_question(
-        self,
-        query: str,
-        sub_question: str,
-        *,
-        depth: str = "standard",
-        conversation_id: str | None = None,
-    ) -> ResearchFinding:
-        return ResearchFinding(
-            sub_question=sub_question,
-            summary=f"Summary for {sub_question}",
-            key_points=[f"Key insight ({depth})"],
-            sources=["https://example.com/ref"],
-        )
-
-    async def synthesize_report_stream(
-        self,
-        query: str,
-        findings: list[ResearchFinding],
-        *,
-        conversation_id: str | None = None,
-        on_delta: Callable[[str], Awaitable[None]] | None = None,
-    ) -> str:
-        chunks = [f"# Deep Research Report: {query}\n\n", "Synthesized findings."]
-        for chunk in chunks:
-            if on_delta is not None:
-                await on_delta(chunk)
-        return "".join(chunks)
 
 
 def _parse_sse_events(body: str) -> list[dict]:
@@ -304,11 +260,9 @@ def _worker_activities(activities: ThreadActivities) -> list:
         activities.record_failed_turns_activity,
         activities.persist_user_message_activity,
         activities.publish_progress_activity,
+        activities.persist_clarifications_widget_activity,
         activities.persist_approval_widget_activity,
-        activities.plan_research_activity,
-        activities.resolve_turn_activity,
-        activities.investigate_sub_question_activity,
-        activities.synthesize_report_activity,
+        activities.publish_report_activity,
         activities.persist_final_item_activity,
         activities.publish_turn_end_activity,
         activities.prune_thread_events_activity,
@@ -316,269 +270,273 @@ def _worker_activities(activities: ThreadActivities) -> list:
 
 
 @pytest.mark.asyncio
-async def test_health_threads_crud_approval_and_streaming() -> None:
+async def test_health_threads_crud_clarifications_approval_and_streaming() -> None:
     store = InMemoryChatKitStore()
     bus = InMemoryThreadEventBus()
-    llm = FakeLLM()
-    activities = ThreadActivities(client=llm, store=store, event_bus=bus)
+    conv_client = FakeConversationClient()
+    fake_model = RoutingFakeModel(clarify_keywords=("best",))
+    activities = ThreadActivities(client=conv_client, store=store, event_bus=bus)
 
-    async with await WorkflowEnvironment.start_time_skipping(
-        data_converter=pydantic_data_converter
-    ) as env:
+    plugin = OpenAIAgentsPlugin(model_provider=TestModelProvider(fake_model))
+    async with await WorkflowEnvironment.start_time_skipping(plugins=[plugin]) as env:
         task_queue = f"test-api-{uuid.uuid4().hex[:8]}"
+        client_manager = TemporalClientManager.from_client(env.client)
         orchestrator = TemporalThreadOrchestrator(
-            env.client, task_queue=task_queue, require_approval=True
+            client_manager, task_queue=task_queue, require_approval=True
         )
         app = create_app(
             settings=Settings(openai_api_key="sk-test"),
             store=store,
             orchestrator=orchestrator,
             event_bus=bus,
+            temporal_client_manager=client_manager,
         )
 
-        async with Worker(
-            env.client,
-            task_queue=task_queue,
-            workflows=[AgentThreadWorkflow],
-            activities=_worker_activities(activities),
+        async with (
+            Worker(
+                env.client,
+                task_queue=task_queue,
+                workflows=[AgentThreadWorkflow],
+                activities=_worker_activities(activities),
+            ),
+            app.router.lifespan_context(app),
         ):
-            async with app.router.lifespan_context(app):
-                transport = httpx.ASGITransport(app=app)
-                async with httpx.AsyncClient(
-                    transport=transport, base_url="http://test"
-                ) as client:
-                    # 1. Health endpoint reports live mode
-                    health_res = await client.get("/health")
-                    assert health_res.status_code == 200
-                    assert health_res.json() == {
-                        "status": "ok",
-                        "postgres": True,
-                        "temporal": True,
-                        "openai_mode": "live",
-                    }
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(
+                transport=transport, base_url="http://test"
+            ) as client:
+                # 1. Health endpoint
+                health_res = await client.get("/health")
+                assert health_res.status_code == 200
+                assert health_res.json() == {
+                    "status": "ok",
+                    "postgres": True,
+                    "temporal": True,
+                    "openai_mode": "live",
+                }
 
-                    # 2. Thread CRUD
-                    create_res = await client.post(
-                        "/api/threads", json={"title": "Initial Thread"}
-                    )
-                    assert create_res.status_code == 200
-                    created_id = create_res.json()["id"]
-                    del_res = await client.delete(f"/api/threads/{created_id}")
-                    assert del_res.status_code == 200
-                    assert (await client.delete(f"/api/threads/{created_id}")).status_code == 404
+                # 2. Thread CRUD
+                create_res = await client.post(
+                    "/api/threads", json={"title": "Initial Thread"}
+                )
+                assert create_res.status_code == 200
+                created_id = create_res.json()["id"]
+                del_res = await client.delete(f"/api/threads/{created_id}")
+                assert del_res.status_code == 200
+                assert (await client.delete(f"/api/threads/{created_id}")).status_code == 404
 
-                    # 3. ChatKit threads.create pauses cleanly at Approval Gate
-                    stream_res = await client.post(
-                        "/chatkit",
-                        json={
-                            "type": "threads.create",
-                            "params": {
-                                "input": {
-                                    "content": [
-                                        {
-                                            "type": "input_text",
-                                            "text": "Compare Temporal and Celery",
-                                        }
+                # 3. Broad query pauses at Clarifications Gate with dynamic widget
+                stream_res = await client.post(
+                    "/chatkit",
+                    json={
+                        "type": "threads.create",
+                        "params": {
+                            "input": {
+                                "content": [
+                                    {
+                                        "type": "input_text",
+                                        "text": "Best agent frameworks",
+                                    }
+                                ],
+                                "attachments": [],
+                                "inference_options": {},
+                            }
+                        },
+                    },
+                )
+                assert stream_res.status_code == 200
+                events = _parse_sse_events(stream_res.text)
+                created_ev = next(e for e in events if e["type"] == "thread.created")
+                thread_id = created_ev["thread"]["id"]
+                widget_events = [
+                    e
+                    for e in events
+                    if e["type"] == "thread.item.done"
+                    and e["item"]["type"] == "widget"
+                ]
+                assert len(widget_events) == 1
+
+                state_res = await client.get(f"/api/threads/{thread_id}/state")
+                state_json = state_res.json()
+                assert state_json["phase"] == "awaiting_clarifications"
+                assert state_json["pending_clarification"] is not None
+
+                # Sending another message while awaiting clarifications reminds user
+                blocked_clarify = await client.post(
+                    "/chatkit",
+                    json={
+                        "type": "threads.add_user_message",
+                        "params": {
+                            "thread_id": thread_id,
+                            "input": {
+                                "content": [{"type": "input_text", "text": "hello"}],
+                                "attachments": [],
+                                "inference_options": {},
+                            },
+                        },
+                    },
+                )
+                assert blocked_clarify.status_code == 200
+                assert any(
+                    e["type"] == "thread.item.done"
+                    and e["item"]["type"] == "assistant_message"
+                    and "clarifying questions" in e["item"]["content"][0]["text"].lower()
+                    for e in _parse_sse_events(blocked_clarify.text)
+                )
+
+                # Stale clarification card click is rejected cleanly via @workflow.update validator
+                stale_clarify_res = await client.post(
+                    "/chatkit",
+                    json={
+                        "type": "threads.custom_action",
+                        "params": {
+                            "thread_id": thread_id,
+                            "action": {
+                                "type": "research.submit_clarifications",
+                                "payload": {
+                                    "workflow_id": "turn_stale_000",
+                                    "questions": state_json["pending_clarification"][
+                                        "questions"
                                     ],
-                                    "attachments": [],
-                                    "inference_options": {},
-                                }
-                            },
-                        },
-                    )
-                    assert stream_res.status_code == 200
-                    events = _parse_sse_events(stream_res.text)
-                    created_ev = next(e for e in events if e["type"] == "thread.created")
-                    thread_id = created_ev["thread"]["id"]
-                    widget_events = [
-                        e
-                        for e in events
-                        if e["type"] == "thread.item.done"
-                        and e["item"]["type"] == "widget"
-                    ]
-                    assert len(widget_events) == 1
-
-                    # 4. State endpoint reflects AWAITING_APPROVAL
-                    state_res = await client.get(f"/api/threads/{thread_id}/state")
-                    assert state_res.status_code == 200
-                    state_json = state_res.json()
-                    assert state_json["phase"] == "awaiting_approval"
-                    assert state_json["pending_approval"] is not None
-
-                    # 5. Approve plan via ChatKit custom action -> streams deltas & final report
-                    approve_res = await client.post(
-                        "/chatkit",
-                        json={
-                            "type": "threads.custom_action",
-                            "params": {
-                                "thread_id": thread_id,
-                                "action": {
-                                    "type": "research.approve_plan",
-                                    "payload": {
-                                        "workflow_id": state_json["active_turn_id"],
-                                        "sub_questions": state_json["pending_approval"][
-                                            "sub_questions"
-                                        ],
-                                        "q_0": True,
-                                        "q_1": True,
-                                        "depth": "deep",
-                                    },
+                                    "q_0": "production",
                                 },
                             },
                         },
-                    )
-                    assert approve_res.status_code == 200
-                    approve_events = _parse_sse_events(approve_res.text)
-                    assert any(
-                        e["type"] == "thread.item.updated" for e in approve_events
-                    )
-                    assistant_done = [
-                        e
-                        for e in approve_events
-                        if e["type"] == "thread.item.done"
-                        and e["item"]["type"] == "assistant_message"
-                    ]
-                    assert len(assistant_done) == 1
-                    assert (
-                        "# Deep Research Report: Compare Temporal and Celery"
-                        in assistant_done[0]["item"]["content"][0]["text"]
-                    )
+                    },
+                )
+                assert stale_clarify_res.status_code == 200
+                assert any(
+                    e["type"] == "thread.item.done"
+                    and e["item"]["type"] == "assistant_message"
+                    and "earlier turn" in e["item"]["content"][0]["text"].lower()
+                    for e in _parse_sse_events(stale_clarify_res.text)
+                )
 
-                    # 6. Follow-up turn via ChatKit pauses at Approval Gate; sending another message while pending reminds user to approve/cancel first
-                    for _ in range(50):
-                        st = (await client.get(f"/api/threads/{thread_id}/state")).json()
-                        if st["phase"] == "idle":
-                            break
-                        await asyncio.sleep(0.02)
-
-                    followup_res = await client.post(
-                        "/chatkit",
-                        json={
-                            "type": "threads.add_user_message",
-                            "params": {
-                                "thread_id": thread_id,
-                                "input": {
-                                    "content": [
-                                        {
-                                            "type": "input_text",
-                                            "text": "Follow-up research question",
-                                        }
+                # 4. Submit dynamic clarifications -> pauses at Plan Approval Gate
+                clarify_res = await client.post(
+                    "/chatkit",
+                    json={
+                        "type": "threads.custom_action",
+                        "params": {
+                            "thread_id": thread_id,
+                            "action": {
+                                "type": "research.submit_clarifications",
+                                "payload": {
+                                    "workflow_id": state_json["active_turn_id"],
+                                    "questions": state_json["pending_clarification"][
+                                        "questions"
                                     ],
-                                    "attachments": [],
-                                    "inference_options": {},
+                                    "q_0": "production",
+                                    "q_1__opt__0": True,
+                                    "q_1__opt__2": True,
+                                    "q_2": "Python + Temporal stack",
                                 },
                             },
                         },
-                    )
-                    assert followup_res.status_code == 200
-                    st = (await client.get(f"/api/threads/{thread_id}/state")).json()
-                    assert st["phase"] == "awaiting_approval"
+                    },
+                )
+                assert clarify_res.status_code == 200
 
-                    blocked_res = await client.post(
-                        "/chatkit",
-                        json={
-                            "type": "threads.add_user_message",
-                            "params": {
-                                "thread_id": thread_id,
-                                "input": {
-                                    "content": [
-                                        {
-                                            "type": "input_text",
-                                            "text": "Another prompt while waiting",
-                                        }
+                state_json = (await client.get(f"/api/threads/{thread_id}/state")).json()
+                assert state_json["phase"] == "awaiting_approval"
+                assert state_json["pending_approval"] is not None
+
+                # 5. Approve plan -> streams deltas & final report
+                approve_res = await client.post(
+                    "/chatkit",
+                    json={
+                        "type": "threads.custom_action",
+                        "params": {
+                            "thread_id": thread_id,
+                            "action": {
+                                "type": "research.approve_plan",
+                                "payload": {
+                                    "workflow_id": state_json["active_turn_id"],
+                                    "sub_questions": state_json["pending_approval"][
+                                        "sub_questions"
                                     ],
-                                    "attachments": [],
-                                    "inference_options": {},
+                                    "q_0": True,
+                                    "q_1": True,
+                                    "depth": "deep",
                                 },
                             },
                         },
-                    )
-                    assert blocked_res.status_code == 200
-                    blocked_events = _parse_sse_events(blocked_res.text)
-                    assert any(
-                        e["type"] == "thread.item.done"
-                        and e["item"]["type"] == "assistant_message"
-                        and "approve or cancel" in e["item"]["content"][0]["text"].lower()
-                        for e in blocked_events
-                    )
-
-                    reject_res = await client.post(
-                        "/chatkit",
-                        json={
-                            "type": "threads.custom_action",
-                            "params": {
-                                "thread_id": thread_id,
-                                "action": {
-                                    "type": "research.reject_plan",
-                                    "payload": {
-                                        "workflow_id": st["active_turn_id"],
-                                        "sub_questions": st["pending_approval"][
-                                            "sub_questions"
-                                        ],
-                                    },
-                                },
-                            },
-                        },
-                    )
-                    assert reject_res.status_code == 200
+                    },
+                )
+                assert approve_res.status_code == 200
+                approve_events = _parse_sse_events(approve_res.text)
+                assert any(
+                    e["type"] == "thread.item.updated" for e in approve_events
+                )
+                assistant_done = [
+                    e
+                    for e in approve_events
+                    if e["type"] == "thread.item.done"
+                    and e["item"]["type"] == "assistant_message"
+                ]
+                assert len(assistant_done) == 1
+                assert (
+                    "# Deep Research Report:"
+                    in assistant_done[0]["item"]["content"][0]["text"]
+                )
 
 
 @pytest.mark.asyncio
 async def test_streaming_report_opens_and_closes_chatkit_content_part() -> None:
-    """Regression test: ChatKit's streaming renderer restarts fade-in animations
-    across earlier blocks if thread.item.added pre-populates content instead of
-    emitting content=[] followed by assistant_message.content_part.added/done.
-    """
     store = InMemoryChatKitStore()
     bus = InMemoryThreadEventBus()
-    llm = FakeLLM()
-    activities = ThreadActivities(client=llm, store=store, event_bus=bus)
+    conv_client = FakeConversationClient()
+    fake_model = RoutingFakeModel()
+    activities = ThreadActivities(client=conv_client, store=store, event_bus=bus)
 
-    async with await WorkflowEnvironment.start_time_skipping(
-        data_converter=pydantic_data_converter
-    ) as env:
+    plugin = OpenAIAgentsPlugin(model_provider=TestModelProvider(fake_model))
+    async with await WorkflowEnvironment.start_time_skipping(plugins=[plugin]) as env:
         task_queue = f"test-stream-proto-{uuid.uuid4().hex[:8]}"
+        client_manager = TemporalClientManager.from_client(env.client)
         orchestrator = TemporalThreadOrchestrator(
-            env.client, task_queue=task_queue, require_approval=False
+            client_manager, task_queue=task_queue, require_approval=False
         )
         app = create_app(
             settings=Settings(openai_api_key="sk-test"),
             store=store,
             orchestrator=orchestrator,
             event_bus=bus,
+            temporal_client_manager=client_manager,
         )
 
-        async with Worker(
-            env.client,
-            task_queue=task_queue,
-            workflows=[AgentThreadWorkflow],
-            activities=_worker_activities(activities),
+        async with (
+            Worker(
+                env.client,
+                task_queue=task_queue,
+                workflows=[AgentThreadWorkflow],
+                activities=_worker_activities(activities),
+            ),
+            app.router.lifespan_context(app),
         ):
-            async with app.router.lifespan_context(app):
-                transport = httpx.ASGITransport(app=app)
-                async with httpx.AsyncClient(
-                    transport=transport, base_url="http://test"
-                ) as client:
-                    res = await client.post(
-                        "/chatkit",
-                        json={
-                            "type": "threads.create",
-                            "params": {
-                                "input": {
-                                    "content": [
-                                        {
-                                            "type": "input_text",
-                                            "text": "Compare Temporal and Celery",
-                                        }
-                                    ],
-                                    "attachments": [],
-                                    "inference_options": {},
-                                }
-                            },
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(
+                transport=transport, base_url="http://test"
+            ) as client:
+                res = await client.post(
+                    "/chatkit",
+                    json={
+                        "type": "threads.create",
+                        "params": {
+                            "input": {
+                                "content": [
+                                    {
+                                        "type": "input_text",
+                                        "text": "Compare Temporal and Celery",
+                                    }
+                                ],
+                                "attachments": [],
+                                "inference_options": {},
+                            }
                         },
-                    )
-                    assert res.status_code == 200
-                    events = _parse_sse_events(res.text)
+                    },
+                )
+                assert res.status_code == 200
+                events = _parse_sse_events(res.text)
 
     added_idx, added_ev = next(
         (i, e)

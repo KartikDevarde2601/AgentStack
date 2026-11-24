@@ -7,6 +7,27 @@ from typing import Annotated, Literal
 from pydantic import BaseModel, Field, StringConstraints
 
 
+class ClarificationOption(BaseModel):
+    """Selectable option for single_select or multi_select clarifying questions."""
+
+    value: str
+    label: str
+    description: str | None = None
+
+
+class ClarificationQuestion(BaseModel):
+    """A clarifying question whose UI control is chosen dynamically by the agent."""
+
+    id: str
+    question: str
+    kind: Literal["single_select", "multi_select", "short_text", "long_text"] = (
+        "short_text"
+    )
+    options: list[ClarificationOption] = Field(default_factory=list)
+    placeholder: str = ""
+    required: bool = True
+
+
 class RequestContext(BaseModel):
     user_id: str = "local-demo"
 
@@ -14,6 +35,7 @@ class RequestContext(BaseModel):
 class ResearchPhase(StrEnum):
     IDLE = "idle"
     QUEUED = "queued"
+    AWAITING_CLARIFICATIONS = "awaiting_clarifications"
     PLANNING = "planning"
     AWAITING_APPROVAL = "awaiting_approval"
     RESEARCHING = "researching"
@@ -32,7 +54,22 @@ class ResearchPhase(StrEnum):
         )
 
 
+class ClarificationSubmission(BaseModel):
+    turn_id: str | None = None
+    skipped: bool = False
+    answers: dict[str, str] = Field(default_factory=dict)
+
+
+class PendingClarification(BaseModel):
+    turn_id: str
+    clarification_id: str
+    intro: str = ""
+    questions: list[ClarificationQuestion] = Field(default_factory=list)
+    widget_item_id: str
+
+
 class ApprovalDecision(BaseModel):
+    turn_id: str | None = None
     approved: bool
     sub_questions: list[str] = Field(default_factory=list)
     depth: Literal["concise", "standard", "deep"] = "standard"
@@ -65,6 +102,7 @@ class ResearchProgress(BaseModel):
     query: str
     phase: ResearchPhase
     message: str
+    enhanced_prompt: str = ""
     sub_questions: list[str] = Field(default_factory=list)
     completed_sub_questions: int = 0
     total_sub_questions: int = 0
@@ -94,6 +132,7 @@ class ThreadWorkflowState(BaseModel):
     phase: ResearchPhase = ResearchPhase.IDLE
     active_turn_id: str | None = None
     message: str = ""
+    pending_clarification: PendingClarification | None = None
     pending_approval: PendingApproval | None = None
     turns_since_continue: int = 0
 
