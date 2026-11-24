@@ -1,60 +1,48 @@
 from __future__ import annotations
 
-import logging
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from datetime import UTC, datetime
-from typing import Any, Literal
+from typing import Any
 
 from chatkit.actions import Action
 from chatkit.server import ChatKitServer
 from chatkit.store import Store
 from chatkit.types import (
     AssistantMessageContent,
-    AssistantMessageContentPartAdded,
-    AssistantMessageContentPartDone,
-    AssistantMessageContentPartTextDelta,
     AssistantMessageItem,
     ProgressUpdateEvent,
     StreamOptions,
     SyncCustomActionResponse,
     ThreadItem,
-    ThreadItemAddedEvent,
     ThreadItemDoneEvent,
-    ThreadItemReplacedEvent,
-    ThreadItemUpdatedEvent,
     ThreadMetadata,
     ThreadStreamEvent,
     UserMessageInput,
     UserMessageItem,
     WidgetItem,
 )
-from pydantic import TypeAdapter
 
-from app.domain import (
-    ApprovalDecision,
-    ClarificationSubmission,
-    IncomingMessage,
-    RequestContext,
-    ResearchPhase,
+from app.chatkit_protocol import (
+    ThreadEventTranslator,
+    build_followup_prompt,
+    parse_approval_decision,
+    parse_clarification_submission,
 )
-from app.events import ThreadEventBus, ThreadEventKind
+from app.domain import IncomingMessage, RequestContext, ResearchPhase
+from app.events import ThreadEventBus
 from app.temporal.client import TemporalUnavailableError
 from app.temporal.orchestrator import ThreadOrchestrator, WorkflowActionRejectedError
 from app.widgets import (
     APPROVE_PLAN_ACTION,
     FOLLOWUP_ACTION,
     REJECT_PLAN_ACTION,
+    RESUME_RESEARCH_ACTION,
     SKIP_CLARIFICATIONS_ACTION,
     SUBMIT_CLARIFICATIONS_ACTION,
     TOGGLE_FINDING_ACTION,
 )
 
-logger = logging.getLogger(__name__)
-
-RESUME_RESEARCH_ACTION = "research.resume"
-_THREAD_ITEM_ADAPTER = TypeAdapter(ThreadItem)
-_VALID_PROGRESS_ICONS = {"clock", "compass", "search", "sparkle", "check-circle", "bug"}
 _TEMPORAL_UNAVAILABLE_MESSAGE = (
     "The Temporal workflow service is currently unavailable. "
     "Please ensure Temporal and the research worker are running and try again."
@@ -64,11 +52,11 @@ _TEMPORAL_UNAVAILABLE_MESSAGE = (
 def extract_user_text(item: UserMessageItem | None) -> str:
     if item is None:
         return ""
-    parts: list[str] = []
-    for content in item.content:
-        text = getattr(content, "text", None)
-        if text:
-            parts.append(str(text))
+    parts = [
+        str(text)
+        for content in item.content
+        if (text := getattr(content, "text", None))
+    ]
     return " ".join(parts).strip()
 
 
@@ -77,6 +65,25 @@ def make_thread_title(query: str, max_len: int = 60) -> str:
     if len(collapsed) <= max_len:
         return collapsed
     return collapsed[: max_len - 1].rstrip() + "…"
+
+
+def _busy_message_for_phase(phase: ResearchPhase) -> str | None:
+    if phase == ResearchPhase.AWAITING_CLARIFICATIONS:
+        return (
+            "Please submit or skip the clarifying questions card above "
+            "before starting a new message."
+        )
+    if phase == ResearchPhase.AWAITING_APPROVAL:
+        return (
+            "Please approve or cancel the pending research plan above "
+            "before starting a new question."
+        )
+    if not phase.is_terminal:
+        return (
+            "A response is already in progress for this thread. "
+            "Please wait for it to finish before sending another message."
+        )
+    return None
 
 
 class DeepResearchChatKitServer(ChatKitServer[RequestContext]):
@@ -143,69 +150,32 @@ class DeepResearchChatKitServer(ChatKitServer[RequestContext]):
             state = await self._orchestrator.get_state(thread.id)
         except TemporalUnavailableError:
             yield self._assistant_message_event(
-                thread=thread,
-                context=context,
-                text=_TEMPORAL_UNAVAILABLE_MESSAGE,
-            )
-            return
-        if state.phase == ResearchPhase.AWAITING_CLARIFICATIONS:
-            yield self._assistant_message_event(
-                thread=thread,
-                context=context,
-                text=(
-                    "Please submit or skip the clarifying questions card above "
-                    "before starting a new message."
-                ),
-            )
-            return
-        if state.phase == ResearchPhase.AWAITING_APPROVAL:
-            yield self._assistant_message_event(
-                thread=thread,
-                context=context,
-                text=(
-                    "Please approve or cancel the pending research plan above "
-                    "before starting a new question."
-                ),
-            )
-            return
-        if not state.phase.is_terminal:
-            yield self._assistant_message_event(
-                thread=thread,
-                context=context,
-                text=(
-                    "A response is already in progress for this thread. "
-                    "Please wait for it to finish before sending another message."
-                ),
+                thread=thread, context=context, text=_TEMPORAL_UNAVAILABLE_MESSAGE
             )
             return
 
-        after_seq = await self._event_bus.latest_seq(thread.id)
+        if busy_message := _busy_message_for_phase(state.phase):
+            yield self._assistant_message_event(
+                thread=thread, context=context, text=busy_message
+            )
+            return
+
         message_id = (
             input_user_message.id
             if input_user_message is not None
             else f"msg_{uuid.uuid4().hex[:12]}"
         )
-        yield ProgressUpdateEvent(
-            icon="clock",
-            text="Reading your request...",
-        )
-        try:
-            await self._orchestrator.send_message(
+        yield ProgressUpdateEvent(icon="clock", text="Reading your request...")
+        async for event in self._dispatch_and_stream(
+            thread=thread,
+            context=context,
+            dispatch=lambda: self._orchestrator.send_message(
                 thread.id,
                 IncomingMessage(
-                    message_id=message_id,
-                    text=query,
-                    already_persisted=True,
+                    message_id=message_id, text=query, already_persisted=True
                 ),
-            )
-        except TemporalUnavailableError:
-            yield self._assistant_message_event(
-                thread=thread,
-                context=context,
-                text=_TEMPORAL_UNAVAILABLE_MESSAGE,
-            )
-            return
-        async for event in self._tail_thread_events(thread.id, after_seq=after_seq):
+            ),
+        ):
             yield event
 
     async def action(
@@ -217,39 +187,43 @@ class DeepResearchChatKitServer(ChatKitServer[RequestContext]):
     ) -> AsyncIterator[ThreadStreamEvent]:
         payload = action.payload if isinstance(action.payload, dict) else {}
 
-        if action.type == RESUME_RESEARCH_ACTION:
-            async for event in self._handle_resume_action(thread):
-                yield event
-            return
-
-        if action.type in (SUBMIT_CLARIFICATIONS_ACTION, SKIP_CLARIFICATIONS_ACTION):
-            async for event in self._handle_clarifications_action(
-                thread=thread,
-                skipped=(action.type == SKIP_CLARIFICATIONS_ACTION),
-                payload=payload,
-                context=context,
+        match action.type:
+            case _ if action.type == RESUME_RESEARCH_ACTION:
+                stream = self._handle_resume_action(thread)
+            case _ if action.type in (
+                SUBMIT_CLARIFICATIONS_ACTION,
+                SKIP_CLARIFICATIONS_ACTION,
             ):
-                yield event
-            return
+                submission = parse_clarification_submission(
+                    payload, skipped=(action.type == SKIP_CLARIFICATIONS_ACTION)
+                )
+                stream = self._dispatch_and_stream(
+                    thread=thread,
+                    context=context,
+                    dispatch=lambda: self._orchestrator.submit_clarifications(
+                        thread.id, submission
+                    ),
+                )
+            case _ if action.type in (APPROVE_PLAN_ACTION, REJECT_PLAN_ACTION):
+                decision = parse_approval_decision(
+                    payload, approved=(action.type == APPROVE_PLAN_ACTION)
+                )
+                stream = self._dispatch_and_stream(
+                    thread=thread,
+                    context=context,
+                    dispatch=lambda: self._orchestrator.submit_approval(
+                        thread.id, decision
+                    ),
+                )
+            case _ if action.type == FOLLOWUP_ACTION:
+                stream = self._handle_followup_action(
+                    thread=thread, payload=payload, context=context
+                )
+            case _:
+                return
 
-        if action.type in (APPROVE_PLAN_ACTION, REJECT_PLAN_ACTION):
-            async for event in self._handle_approval_action(
-                thread=thread,
-                approved=(action.type == APPROVE_PLAN_ACTION),
-                payload=payload,
-                context=context,
-            ):
-                yield event
-            return
-
-        if action.type == FOLLOWUP_ACTION:
-            async for event in self._handle_followup_action(
-                thread=thread,
-                payload=payload,
-                context=context,
-            ):
-                yield event
-            return
+        async for event in stream:
+            yield event
 
     async def sync_action(
         self,
@@ -279,116 +253,6 @@ class DeepResearchChatKitServer(ChatKitServer[RequestContext]):
         ):
             yield event
 
-    async def _handle_clarifications_action(
-        self,
-        *,
-        thread: ThreadMetadata,
-        skipped: bool,
-        payload: dict[str, Any],
-        context: RequestContext,
-    ) -> AsyncIterator[ThreadStreamEvent]:
-        answers: dict[str, str] = {}
-        if not skipped:
-            raw_questions = payload.get("questions") or []
-            for idx, raw_q in enumerate(raw_questions):
-                if not isinstance(raw_q, dict):
-                    continue
-                q_id = str(raw_q.get("id") or f"q_{idx}")
-                q_kind = str(raw_q.get("kind") or "short_text")
-                if q_kind == "multi_select":
-                    options = raw_q.get("options") or []
-                    selected: list[str] = []
-                    for opt_idx, opt in enumerate(options):
-                        if self._is_truthy_checkbox(
-                            payload.get(f"{q_id}__opt__{opt_idx}")
-                        ):
-                            label = (
-                                str(opt.get("label") or opt.get("value") or "")
-                                if isinstance(opt, dict)
-                                else str(opt)
-                            )
-                            if label:
-                                selected.append(label)
-                    answers[q_id] = ", ".join(selected) if selected else "No preference"
-                else:
-                    val = str(payload.get(q_id) or "").strip()
-                    answers[q_id] = val or "No preference"
-
-        turn_id = str(payload.get("workflow_id") or "").strip() or None
-        submission = ClarificationSubmission(
-            turn_id=turn_id, skipped=skipped, answers=answers
-        )
-        after_seq = await self._event_bus.latest_seq(thread.id)
-        try:
-            await self._orchestrator.submit_clarifications(thread.id, submission)
-        except TemporalUnavailableError:
-            yield self._assistant_message_event(
-                thread=thread, context=context, text=_TEMPORAL_UNAVAILABLE_MESSAGE
-            )
-            return
-        except WorkflowActionRejectedError as exc:
-            yield self._assistant_message_event(
-                thread=thread, context=context, text=str(exc)
-            )
-            return
-        async for event in self._tail_thread_events(thread.id, after_seq=after_seq):
-            yield event
-
-    async def _handle_approval_action(
-        self,
-        *,
-        thread: ThreadMetadata,
-        approved: bool,
-        payload: dict[str, Any],
-        context: RequestContext,
-    ) -> AsyncIterator[ThreadStreamEvent]:
-        original_questions = [
-            str(q) for q in (payload.get("sub_questions") or []) if str(q).strip()
-        ]
-        checkbox_keys = [k for k in payload if k.startswith("q_")]
-        if checkbox_keys and original_questions:
-            selected_questions = [
-                q
-                for idx, q in enumerate(original_questions)
-                if self._is_truthy_checkbox(payload.get(f"q_{idx}"))
-            ]
-            if not selected_questions:
-                selected_questions = original_questions
-        else:
-            selected_questions = original_questions
-
-        raw_depth = str(payload.get("depth") or "standard").lower()
-        depth: Literal["concise", "standard", "deep"] = (
-            raw_depth if raw_depth in ("concise", "standard", "deep") else "standard"  # type: ignore[assignment]
-        )
-        extra_focus = str(payload.get("extra_focus") or "").strip()
-        turn_id = str(payload.get("workflow_id") or "").strip() or None
-
-        decision = ApprovalDecision(
-            turn_id=turn_id,
-            approved=approved,
-            sub_questions=selected_questions,
-            depth=depth,
-            extra_focus=extra_focus,
-            reason=None if approved else "Cancelled by user in approval card.",
-        )
-
-        after_seq = await self._event_bus.latest_seq(thread.id)
-        try:
-            await self._orchestrator.submit_approval(thread.id, decision)
-        except TemporalUnavailableError:
-            yield self._assistant_message_event(
-                thread=thread, context=context, text=_TEMPORAL_UNAVAILABLE_MESSAGE
-            )
-            return
-        except WorkflowActionRejectedError as exc:
-            yield self._assistant_message_event(
-                thread=thread, context=context, text=str(exc)
-            )
-            return
-        async for event in self._tail_thread_events(thread.id, after_seq=after_seq):
-            yield event
-
     async def _handle_followup_action(
         self,
         *,
@@ -396,18 +260,9 @@ class DeepResearchChatKitServer(ChatKitServer[RequestContext]):
         payload: dict[str, Any],
         context: RequestContext,
     ) -> AsyncIterator[ThreadStreamEvent]:
-        mode = str(payload.get("mode") or "executive_summary")
-        base_query = str(payload.get("query") or thread.title or "this topic").strip()
-        custom_prompt = str(payload.get("prompt") or "").strip()
-        prompts = {
-            "executive_summary": f"Provide a concise executive summary and key risks for: {base_query}",
-            "deep_dive": f"Do a deeper technical and operational dive into: {base_query}",
-            "compare_alternatives": f"Compare the main alternatives and tradeoffs for: {base_query}",
-        }
-        if mode == "custom" and custom_prompt:
-            prompt = custom_prompt
-        else:
-            prompt = prompts.get(mode, f"Follow up on: {base_query}")
+        prompt = build_followup_prompt(
+            payload, fallback_query=thread.title or "this topic"
+        )
         try:
             state = await self._orchestrator.get_state(thread.id)
         except TemporalUnavailableError:
@@ -417,19 +272,38 @@ class DeepResearchChatKitServer(ChatKitServer[RequestContext]):
             return
         if not state.phase.is_terminal:
             return
-        after_seq = await self._event_bus.latest_seq(thread.id)
-        try:
-            await self._orchestrator.send_message(
+        async for event in self._dispatch_and_stream(
+            thread=thread,
+            context=context,
+            dispatch=lambda: self._orchestrator.send_message(
                 thread.id,
                 IncomingMessage(
                     message_id=f"msg_{uuid.uuid4().hex[:12]}",
                     text=prompt,
                     already_persisted=False,
                 ),
-            )
+            ),
+        ):
+            yield event
+
+    async def _dispatch_and_stream(
+        self,
+        *,
+        thread: ThreadMetadata,
+        context: RequestContext,
+        dispatch: Callable[[], Awaitable[Any]],
+    ) -> AsyncIterator[ThreadStreamEvent]:
+        after_seq = await self._event_bus.latest_seq(thread.id)
+        try:
+            await dispatch()
         except TemporalUnavailableError:
             yield self._assistant_message_event(
                 thread=thread, context=context, text=_TEMPORAL_UNAVAILABLE_MESSAGE
+            )
+            return
+        except WorkflowActionRejectedError as exc:
+            yield self._assistant_message_event(
+                thread=thread, context=context, text=str(exc)
             )
             return
         async for event in self._tail_thread_events(thread.id, after_seq=after_seq):
@@ -442,80 +316,12 @@ class DeepResearchChatKitServer(ChatKitServer[RequestContext]):
         after_seq: int,
         active_turn_id: str | None = None,
     ) -> AsyncIterator[ThreadStreamEvent]:
-        highest_attempt_by_activity: dict[str, int] = {}
-        open_content_part_items: set[str] = set()
-
+        translator = ThreadEventTranslator(active_turn_id=active_turn_id)
         async for ev in self._event_bus.subscribe(thread_id, after_seq=after_seq):
-            if active_turn_id is not None and ev.turn_id != active_turn_id:
-                continue
-
-            if ev.activity_id is not None:
-                prev_attempt = highest_attempt_by_activity.get(ev.activity_id, 0)
-                if ev.attempt < prev_attempt:
-                    continue
-                is_retry = prev_attempt > 0 and ev.attempt > prev_attempt
-                highest_attempt_by_activity[ev.activity_id] = ev.attempt
-            else:
-                is_retry = False
-
-            if ev.kind == ThreadEventKind.PROGRESS:
-                icon = str(ev.payload.get("icon") or "compass")
-                if icon not in _VALID_PROGRESS_ICONS:
-                    icon = "compass"
-                yield ProgressUpdateEvent(
-                    icon=icon,  # type: ignore[arg-type]
-                    text=str(ev.payload.get("text") or ""),
-                )
-            elif ev.kind == ThreadEventKind.ITEM_ADDED:
-                item = _THREAD_ITEM_ADAPTER.validate_python(ev.payload["item"])
-                is_streaming_assistant = isinstance(item, AssistantMessageItem) and (
-                    not item.content
-                    or (len(item.content) == 1 and not item.content[0].text)
-                )
-                if is_streaming_assistant:
-                    item = item.model_copy(update={"content": []})
-                if is_retry:
-                    # Reset previously streamed partial text before retry deltas arrive.
-                    yield ThreadItemReplacedEvent(item=item)
-                else:
-                    yield ThreadItemAddedEvent(item=item)
-                if is_streaming_assistant:
-                    open_content_part_items.add(item.id)
-                    yield ThreadItemUpdatedEvent(
-                        item_id=item.id,
-                        update=AssistantMessageContentPartAdded(
-                            content_index=0,
-                            content=AssistantMessageContent(text=""),
-                        ),
-                    )
-            elif ev.kind == ThreadEventKind.TEXT_DELTA:
-                yield ThreadItemUpdatedEvent(
-                    item_id=str(ev.payload["item_id"]),
-                    update=AssistantMessageContentPartTextDelta(
-                        content_index=0,
-                        delta=str(ev.payload.get("delta") or ""),
-                    ),
-                )
-            elif ev.kind == ThreadEventKind.ITEM_DONE:
-                item = _THREAD_ITEM_ADAPTER.validate_python(ev.payload["item"])
-                if (
-                    isinstance(item, AssistantMessageItem)
-                    and item.id in open_content_part_items
-                ):
-                    open_content_part_items.discard(item.id)
-                    if item.content:
-                        yield ThreadItemUpdatedEvent(
-                            item_id=item.id,
-                            update=AssistantMessageContentPartDone(
-                                content_index=0,
-                                content=item.content[0],
-                            ),
-                        )
-                yield ThreadItemDoneEvent(item=item)
-            elif ev.kind == ThreadEventKind.ITEM_REPLACED:
-                item = _THREAD_ITEM_ADAPTER.validate_python(ev.payload["item"])
-                yield ThreadItemReplacedEvent(item=item)
-            elif ev.kind in (ThreadEventKind.APPROVAL_PAUSE, ThreadEventKind.TURN_END):
+            events, should_stop = translator.translate(ev)
+            for out_event in events:
+                yield out_event
+            if should_stop:
                 return
 
     def _assistant_message_event(
@@ -532,11 +338,3 @@ class DeepResearchChatKitServer(ChatKitServer[RequestContext]):
             content=[AssistantMessageContent(text=text)],
         )
         return ThreadItemDoneEvent(item=item)
-
-    @staticmethod
-    def _is_truthy_checkbox(value: Any) -> bool:
-        if isinstance(value, bool):
-            return value
-        if isinstance(value, str):
-            return value.strip().lower() in ("true", "1", "yes", "on")
-        return bool(value)

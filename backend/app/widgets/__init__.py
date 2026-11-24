@@ -14,6 +14,7 @@ APPROVE_PLAN_ACTION = "research.approve_plan"
 REJECT_PLAN_ACTION = "research.reject_plan"
 TOGGLE_FINDING_ACTION = "research.toggle_finding"
 FOLLOWUP_ACTION = "research.followup"
+RESUME_RESEARCH_ACTION = "research.resume"
 
 # Official ChatKit WidgetTemplate architecture: load declarative .widget files
 # (version 1.0 JSON + Jinja2 template + JSON Schema) via WidgetTemplate.from_file().

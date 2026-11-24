@@ -96,7 +96,9 @@ def create_app(
                 await pool.close()
 
     app = FastAPI(title="AgentStack Deep Research Backend", lifespan=lifespan)
+
     allow_all_origins = "*" in cfg.cors_origin_list
+
     app.add_middleware(
         CORSMiddleware,
         allow_origins=[] if allow_all_origins else cfg.cors_origin_list,
